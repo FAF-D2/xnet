@@ -60,7 +60,7 @@ Each client sends a 500‑byte echo request every 0–20 ms (uniform random), me
 |--------|------|-------|--------|
 | **xnet** | **235.57 ms** | **303.257 ms** | **42,133** |
 | Asio | 249.524 ms | 318.82 ms | 40,876 |
-| Go | 309.681 ms |  311.7 ms | 41,0556 |
+| Go | 309.681 ms |  311.7 ms | 41,056 |
 
 
 
