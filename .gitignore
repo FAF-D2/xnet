@@ -1,0 +1,16 @@
+# editor
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# binaries
+*.o
+*.obj
+*.so
+*.a
+*.exe
