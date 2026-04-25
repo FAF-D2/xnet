@@ -1,12 +1,11 @@
 # xnet
 
 ## About this project
-xnet is a **lightweight, 2k-line header-only** I/O layer that exposes minimal awaiters built on io_uring and C++20 coroutines. 
+xnet is a **lightweight, ~2k-line, header-only** async I/O layer that exposes minimal awaiters built on **io_uring (via liburing)** and **C++20 coroutines**.
 
+It does **one thing only**: fast, minimal, scheduler‑agnostic asynchronous I/O — with each IOAwaiter costing only **32–64 bytes** of overhead.
 
-It does **one thing only**: fast, minimal, scheduler-agnostic I/O with each IOAwaiter costing only 32–64 bytes of overhead.
-
-**No scheduler, no runtime—just the minimum I/O primitives you can drop into your code.*
+**No scheduler, no runtime — just the minimal I/O primitives you can drop directly into your own coroutine system.*
 
 ## Quickstart
 
