@@ -106,8 +106,16 @@ namespace xnet{
             using args_type = std::tuple<const void*, unsigned, __u64>;
         };
         template<>
+        struct args_traits<decltype(&::io_uring_prep_writev), ::io_uring_prep_writev>{
+            using args_type = std::tuple<const struct iovec*, unsigned, __u64>;
+        };
+        template<>
         struct args_traits<decltype(&details::prep_sendfile), details::prep_sendfile>{
             using args_type = std::tuple<int, int64_t, unsigned int, unsigned int>;
+        };
+        template<>
+        struct args_traits<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>{
+            using args_type = std::tuple<const struct iovec*, unsigned, __u64>;
         };
         template<>
         struct args_traits<decltype(&::io_uring_prep_recvmsg), ::io_uring_prep_recvmsg>{
@@ -252,21 +260,42 @@ namespace xnet{
 
         typedef details::io_result<bool>(*Call)(void*);
 
-        void* p;
         Call call_func;
+        // void* p;
+        details::atomic_type<void*> p;
     public:
         CancelHandle() = default;
-        CancelHandle(const CancelHandle&) = default;
         ~CancelHandle() = default;
         template<class T>
-        CancelHandle(T* t) noexcept: p(t), call_func(call_traits<T>)
+        CancelHandle(T* t) noexcept: call_func(call_traits<T>), p(t)
         {}
+    
+    #ifdef XNET_DISABLE_THREAD_SAFE
+        CancelHandle(const CancelHandle&) = default;
+        CancelHandle& operator=(const CancelHandle& other) = default;
 
         details::io_result<bool> cancel() noexcept{ return this->call_func(this->p); }
         bool invalid() const noexcept { return this->p == nullptr; }
         void reset() noexcept{
             this->p = nullptr;
         }
+    #else
+        CancelHandle(const CancelHandle& other) 
+        noexcept: call_func(other.call_func), p(other.p.load(std::memory_order_acquire))
+        {}
+        CancelHandle& operator=(const CancelHandle& other) noexcept {
+            call_func = other.call_func;
+            void* ptr = other.p.load(std::memory_order_acquire);
+            p.store(ptr, std::memory_order_release);
+            return *this;
+        }
+
+        details::io_result<bool> cancel() noexcept{ return this->call_func(this->p.load(std::memory_order_acquire)); }
+        bool invalid() const noexcept { return p.load(std::memory_order_acquire) == nullptr; }
+        void reset() noexcept{
+            p.store(nullptr, std::memory_order_release);
+        }
+    #endif
 
         template<class T>
         static CancelHandle make_handle(T* t) noexcept { return CancelHandle(t); }
@@ -347,12 +376,15 @@ namespace xnet{
         bool pending() const noexcept { return this->h != nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            if(!h.promise().cancelhandle.invalid()){
+            bool suspended = (h != nullptr);
+            bool notfinished = (!h.done());
+            bool awaiting_io_awaiter = !h.promise().cancelhandle.invalid();
+            if(suspended && notfinished && awaiting_io_awaiter){
                 auto handle = this->h.promise().cancelhandle;
                 this->h.promise().cancelhandle.reset();
                 return handle.cancel();
             }
-            return details::io_result<bool>(false, EAGAIN);
+            return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
         }
 
         auto operator co_await() {
@@ -438,12 +470,15 @@ namespace xnet{
         bool pending() const noexcept { return this->h != nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            if(!h.promise().cancelhandle.invalid()){
+            bool suspended = (h != nullptr);
+            bool notfinished = (!h.done());
+            bool awaiting_io_awaiter = !h.promise().cancelhandle.invalid();
+            if(suspended && notfinished && awaiting_io_awaiter){
                 auto handle = this->h.promise().cancelhandle;
                 this->h.promise().cancelhandle.reset();
                 return handle.cancel();
             }
-            return details::io_result<bool>(false, EAGAIN);
+            return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
         }
         
         auto operator co_await() {
@@ -1126,7 +1161,7 @@ namespace xnet{
                 }
                 return details::io_result<bool>(std::move(submitted), submitted ? 0 : EAGAIN);
             }
-            return details::io_result<bool>(true, 0); 
+            return details::io_result<bool>(false, EAGAIN);
         }
     public:
         static constexpr unsigned int default_flags = IORING_SETUP_CLAMP;
@@ -1579,10 +1614,12 @@ namespace xnet{
             using AwaitableSendto = IOAwaiter<decltype(&::io_uring_prep_sendto), ::io_uring_prep_sendto>;
             using AwaitableSendMsg = IOAwaiter<decltype(&::io_uring_prep_sendmsg), ::io_uring_prep_sendmsg>;
             using AwaitableSend = IOAwaiter<decltype(&::io_uring_prep_send), ::io_uring_prep_send>;
+            using AwaitableWriteV = IOAwaiter<decltype(&::io_uring_prep_writev), ::io_uring_prep_writev>;
             using AwaitableWrite = IOAwaiter<decltype(&::io_uring_prep_write), ::io_uring_prep_write>;
             using AwaitableSendfile = IOAwaiter<decltype(details::prep_sendfile), details::prep_sendfile>;
             using AwaitableConnect = IOAwaiter<decltype(&::io_uring_prep_connect), ::io_uring_prep_connect>;
 
+            using AwaitableReadV = IOAwaiter<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>;
             using AwaitableRecvMsg = IOAwaiter<decltype(&::io_uring_prep_recvmsg), ::io_uring_prep_recvmsg>;
             using AwaitableRecv = IOAwaiter<decltype(&::io_uring_prep_recv), ::io_uring_prep_recv>;
             using AwaitableRead = IOAwaiter<decltype(&::io_uring_prep_read), ::io_uring_prep_read>;
@@ -1600,6 +1637,9 @@ namespace xnet{
             }
             AwaitableSend send(const void* buf, size_t len, int flags) noexcept {
                 return AwaitableSend(*this, buf, len, flags | MSG_NOSIGNAL); 
+            }
+            AwaitableWriteV writev(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset) noexcept{
+                return AwaitableWriteV(*this, iovecs, nr_vecs, offset);
             }
             AwaitableWrite write(const void* buf, unsigned int nbytes, unsigned long long offset) noexcept{
                 return AwaitableWrite(*this, buf, nbytes, offset);
@@ -1626,6 +1666,9 @@ namespace xnet{
                 return AwaitableConnect(*this, addr, addrlen);
             }
             
+            AwaitableReadV readv(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset) noexcept{
+                return AwaitableReadV(*this, iovecs, nr_vecs, offset);
+            }
             AwaitableRecvMsg recvmsg(msghdr* msg, unsigned int flags) noexcept { 
                 return AwaitableRecvMsg(*this, msg, flags); 
             }
