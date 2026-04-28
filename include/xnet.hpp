@@ -110,8 +110,16 @@ namespace xnet{
             using args_type = std::tuple<const struct iovec*, unsigned, __u64>;
         };
         template<>
+        struct args_traits<decltype(&::io_uring_prep_write_fixed), ::io_uring_prep_write_fixed>{
+            using args_type = std::tuple<const struct iovec*, unsigned, __u64, int>;
+        };
+        template<>
         struct args_traits<decltype(&details::prep_sendfile), details::prep_sendfile>{
             using args_type = std::tuple<int, int64_t, unsigned int, unsigned int>;
+        };
+        template<>
+        struct args_traits<decltype(&::io_uring_prep_read_fixed), ::io_uring_prep_read_fixed>{
+            using args_type = std::tuple<const struct iovec*, unsigned, __u64, int>;
         };
         template<>
         struct args_traits<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>{
@@ -1615,10 +1623,12 @@ namespace xnet{
             using AwaitableSendMsg = IOAwaiter<decltype(&::io_uring_prep_sendmsg), ::io_uring_prep_sendmsg>;
             using AwaitableSend = IOAwaiter<decltype(&::io_uring_prep_send), ::io_uring_prep_send>;
             using AwaitableWriteV = IOAwaiter<decltype(&::io_uring_prep_writev), ::io_uring_prep_writev>;
+            using AwaitableWriteFixed = IOAwaiter<decltype(&::io_uring_prep_write_fixed), ::io_uring_prep_write_fixed>;
             using AwaitableWrite = IOAwaiter<decltype(&::io_uring_prep_write), ::io_uring_prep_write>;
-            using AwaitableSendfile = IOAwaiter<decltype(details::prep_sendfile), details::prep_sendfile>;
+            using AwaitableSendfile = IOAwaiter<decltype(&details::prep_sendfile), details::prep_sendfile>;
             using AwaitableConnect = IOAwaiter<decltype(&::io_uring_prep_connect), ::io_uring_prep_connect>;
 
+            using AwaitableReadFixed = IOAwaiter<decltype(&::io_uring_prep_read_fixed), ::io_uring_prep_read_fixed>;
             using AwaitableReadV = IOAwaiter<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>;
             using AwaitableRecvMsg = IOAwaiter<decltype(&::io_uring_prep_recvmsg), ::io_uring_prep_recvmsg>;
             using AwaitableRecv = IOAwaiter<decltype(&::io_uring_prep_recv), ::io_uring_prep_recv>;
@@ -1640,6 +1650,9 @@ namespace xnet{
             }
             AwaitableWriteV writev(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset) noexcept{
                 return AwaitableWriteV(*this, iovecs, nr_vecs, offset);
+            }
+            AwaitableWriteFixed write_fixed(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset, int buf_index) noexcept{
+                return AwaitableWriteFixed(*this, iovecs, nr_vecs, offset, buf_index);
             }
             AwaitableWrite write(const void* buf, unsigned int nbytes, unsigned long long offset) noexcept{
                 return AwaitableWrite(*this, buf, nbytes, offset);
@@ -1665,7 +1678,10 @@ namespace xnet{
                 }
                 return AwaitableConnect(*this, addr, addrlen);
             }
-            
+
+            AwaitableReadFixed read_fixed(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset, int buf_index) noexcept{
+                return AwaitableReadFixed(*this, iovecs, nr_vecs, offset, buf_index);
+            }
             AwaitableReadV readv(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset) noexcept{
                 return AwaitableReadV(*this, iovecs, nr_vecs, offset);
             }
