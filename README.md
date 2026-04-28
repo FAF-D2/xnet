@@ -171,6 +171,14 @@ if(result.err) // err handling
 size_t readed_bytes = *result;
 ```
 
+4. **xnet strictly define the ownership model of the IOAwaiters**: at any moment, an IOAwaiters should always be **owned by exactly only one entity**. Concretly:
++ An IOAwaiter is either owned by the io_uring backend (while the operation is in-flight co_awaiting)
++ or owned by only one entity (before submission or after completion).
+
+If you need to share an IOAwaiter across multiple coroutines or threads (e.g. cancellation), you might wrap it in a smart pointer to state the shared ownership. 
+
+For examples and detailed reasoning, See the following section [Cancellation mechanism](#cancellation-mechanism).
+
 ## API Overview
 
 ### Core type
@@ -193,19 +201,58 @@ Coroutine types for user coroutines. detached_task is a fire & forget coroutine
 
 5. Async combinators `any`, `race`, `all`, `allSettled`
 
-## Cancellation status / known limitation
-xnet does not yet guarantee a complete or stable cancellation model.
+## Cancellation mechanism
+xnet does not use a “cancellation token + check‑on‑resume” model.
+Instead, xnet requires users to explicitly manage the shared state of an IOAwaiter (see Contract 4).
 
-Currently the cancel() api only sends the cancel event to the io uring and does nothing than that. This implementation might not be useful in most cases as:
-    
-+ **Dependent logic cancellation**:
-Some applications might require co_await task.cancel() to know whether the operation was actually cancelled or had already completed.
-xnet does not yet support this.
+The following example shows a typical misuse that results in a use‑after‑free:
 
-+ **Cancellation of operations that were never submitted**: If an I/O operation has not been awaited (and therefore no SQE was ever retrieved), calling cancel() still sends a cancel request.
-This is wasteful and semantically incorrect.
+```cpp
+template<class T>
+xnet::detached_task cancel_after_time(T&& awaiter, int timed){
+    // an example
+    // multi-threads scenario is similar
+    AsyncTimer timer(awaiter.context());
+    co_await timer.timeout(timed);
+    awaiter.cancel(); // boom: awaiter use after free !!!!
+}
 
-+ **Cancellation after coroutine destruction**：
-If the coroutine frame has already finished and been destroyed, other coroutines may still call op.cancel(), which is unsafe without a lifetime‑independent cancellation handle.
+xnet::task<size_t> func(xnet::TCPServer s){
+    auto awaiter = s.recv(...);
+    cancel_after_time(awaiter, 10);
+    auto result = co_await awaiter; // awaiter returned within 10s
+    co_return *result; // func returned and destroyed the awaiter
+    // at 10s the cancel_after_time execute ``awaiter.cancel()``
+}
+```
 
-If you have experience with cancellation semantics or structured concurrency, I will be very grateful for your discussion and design input.
+The correct implementation should be:
+```cpp
+template<class T>
+xnet::detached_task cancel_after_time(T awaiter, int timed){
+    AsyncTimer timer(awaiter->context());
+    co_await timer.timeout(timed);
+    awaiter->cancel(); // safe
+}
+
+xnet::task<size_t> func(xnet::TCPServer s){
+    // *(the ownership of IOAwaiter is owned by the shared_ptr now)*
+    using awaiter_t = decltype(s.recv(...));
+    auto shared_awaiter = std::make_shared<awaiter_t>(s.recv(...));
+
+    cancel_after_time(shared_awaiter, 10);
+    auto result = co_await *shared_awaiter; // awaiter returned within 10s
+    co_return *result;
+    // func returned and destroyed the shared_ptr
+    // at 10s the cancel_after_time execute ``awaiter.cancel()``
+}
+```
+
+Benefit from the exclusive ownership, the `task<>::cancel()` can just simply send the cancel signal to io_uring if the coroutine is awaiting the IOAwaiter, and the coroutine will **never** resume immediately as the io_uring is taking the ownership at this time. 
+
+The return value of `cancel()` is io_result\<bool\>:
++ {true, 0} cancel signal sended, will cancel the actual IO if it is not completed
++ {false, EAGAIN}  the coroutine is not suspended or suspended failed (Get SQE error)
++ {false, ECANCELLED} (the coroutine is already finished)
+
+For fully control to the behaviour of your coroutine cancellation, you might decide your own task type with promise_type by refering to the implementation of `cancel()` and `xcoro_hook()` (hooked in `await_suspend()` by all IOAwaiters) in task\<T\> as well.
