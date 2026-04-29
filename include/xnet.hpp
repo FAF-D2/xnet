@@ -38,12 +38,6 @@
 #define XNET_SET_FLAGS_SKIP_SUCCESS(sqe)
 #endif
 
-#ifdef XNET_ENABLE_SSL
-#include<openssl/ssl.h>
-#include<openssl/err.h>
-#endif
-
-
 namespace xnet{
     static constexpr int INVALID_HANDLE = -1;
     static constexpr int SOCKET_ERROR = -1;
@@ -189,13 +183,10 @@ namespace xnet{
         template<typename T>
         class [[nodiscard]] io_result{
         private:
-            union{
-                T value;
-                unsigned char bytes[sizeof(T)];
-            };
+            T value;
         public:
             int err = -1;
-            io_result() noexcept: bytes(), err(-1){}
+            io_result() noexcept: value(), err(-1){}
             io_result(const io_result&) = delete;
             io_result(io_result&& other) noexcept: value(std::move(other.value)), err(other.err){}
             void operator=(io_result&& other) noexcept{
@@ -1317,6 +1308,7 @@ namespace xnet{
 
             using addr_type = typename details::GET_ADDRTYPE<domain, 0>::type;
 
+            AsyncStream() noexcept: ctx(nullptr), stream(INVALID_HANDLE){}
             AsyncStream(io_context& ctx, int fd) noexcept: ctx(&ctx), stream(fd){}
             AsyncStream(io_context& ctx, const addr_type* addr = nullptr) noexcept: ctx(&ctx), stream(initfd)
             {
