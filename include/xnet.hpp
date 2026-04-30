@@ -84,6 +84,10 @@ namespace xnet{
         template<class F, F io_func>
         struct args_traits{};
         template<>
+        struct args_traits<decltype(&::io_uring_prep_poll_add), ::io_uring_prep_poll_add>{
+            using args_type = std::tuple<unsigned int>;
+        };
+        template<>
         struct args_traits<decltype(&::io_uring_prep_sendto), ::io_uring_prep_sendto>{
             using args_type = std::tuple<const void*, size_t, int, const struct sockaddr*, socklen_t>;
         };
@@ -193,7 +197,8 @@ namespace xnet{
                 value = std::move(other.value);
                 err = other.err;
             }
-            io_result(T&& v, int err) noexcept: value(std::move(v)), err(err){}
+            template<class V>
+            io_result(V&& v, int err) noexcept: value(std::forward<V>(v)), err(err){}
             ~io_result(){}
 
             T& operator*() noexcept{
@@ -1158,7 +1163,7 @@ namespace xnet{
                 if constexpr(details::THREAD_SAFE_REQUIRED){
                     async_type.ctx->unlock();
                 }
-                return details::io_result<bool>(std::move(submitted), submitted ? 0 : EAGAIN);
+                return details::io_result<bool>(submitted, submitted ? 0 : EAGAIN);
             }
             return details::io_result<bool>(false, EAGAIN);
         }
@@ -1474,7 +1479,7 @@ namespace xnet{
                             this->handler = nullptr;
                             this->stream.ctx->sub_events(1);
                         }
-                        return details::io_result<size_t>(std::move(r), err);
+                        return details::io_result<size_t>(r, err);
                     }
                 };
 
@@ -1552,7 +1557,7 @@ namespace xnet{
                         this->handler = nullptr;
                         this->stream.ctx->sub_events(1);
                     }
-                    return details::io_result<size_t>(std::move(r), err);
+                    return details::io_result<size_t>(r, err);
                 }
             };
         public:
@@ -1611,6 +1616,7 @@ namespace xnet{
                 return addr_type{};
             }
 
+            using AwaitablePollAdd = IOAwaiter<decltype(&::io_uring_prep_poll_add), ::io_uring_prep_poll_add>;
             using AwaitableSendto = IOAwaiter<decltype(&::io_uring_prep_sendto), ::io_uring_prep_sendto>;
             using AwaitableSendMsg = IOAwaiter<decltype(&::io_uring_prep_sendmsg), ::io_uring_prep_sendmsg>;
             using AwaitableSend = IOAwaiter<decltype(&::io_uring_prep_send), ::io_uring_prep_send>;
@@ -1631,6 +1637,15 @@ namespace xnet{
             using AwaitableFadvise = IOAwaiter<decltype(&::io_uring_prep_fadvise), ::io_uring_prep_fadvise>;
 
 
+            AwaitablePollAdd poll_add(unsigned int poll_mask) noexcept{
+                return AwaitablePollAdd(*this, poll_mask);
+            }
+            AwaitablePollAdd readable() noexcept{
+                return AwaitablePollAdd(*this, POLL_IN);
+            }
+            AwaitablePollAdd writable() noexcept{
+                return AwaitablePollAdd(*this, POLL_OUT);
+            }
             AwaitableSendto sendto(const void* buf, size_t len, int flags, const struct sockaddr* addr, socklen_t addlen) noexcept { 
                 return AwaitableSendto(*this, buf, len, flags | MSG_NOSIGNAL, addr, addlen);
             }
@@ -2195,7 +2210,7 @@ namespace xnet{
                         return T(AsyncFile(*this->filesystem.ctx, result), err);
                     }
                     else{
-                        return T(std::move(result), err);
+                        return T(result, err);
                     }
                 }
             };
