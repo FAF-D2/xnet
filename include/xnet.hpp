@@ -362,6 +362,7 @@ namespace xnet{
         task(std::coroutine_handle<promise_type> h) : h(h) {}
         task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(task&& other) noexcept{
+            if(this->h) this->h.destroy();
             this->h = std::exchange(other.h, nullptr);
         }
         task(const task&) = delete;
@@ -456,6 +457,7 @@ namespace xnet{
         task(std::coroutine_handle<promise_type> h) : h(h) {}
         task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(task&& other) noexcept{
+            if(this->h) this->h.destroy();
             this->h = std::exchange(other.h, nullptr);
         }
         task(const task&) = delete;
