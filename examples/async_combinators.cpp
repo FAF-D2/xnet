@@ -19,10 +19,11 @@ int main() {
 }
 
 xnet::detached_task run_all_demos(xnet::io_context& ctx){
-    co_await demo_any(ctx);
-    co_await demo_race(ctx);
-    co_await demo_all(ctx);
-    co_await demo_allSettled(ctx);
+    xnet::fire(demo_any(ctx));
+    xnet::fire(demo_race(ctx));
+    xnet::fire(demo_all(ctx));
+    xnet::fire(demo_allSettled(ctx));
+    co_return;
 }
 
 template<bool ret_error>

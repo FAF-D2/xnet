@@ -402,7 +402,6 @@ namespace xnet{
 
                 auto await_suspend(std::coroutine_handle<> caller) noexcept {
                     h.promise().waiter = caller;
-                    // if(!h.done()) h.resume();
                     return h;
                 }
 
@@ -417,7 +416,6 @@ namespace xnet{
     template<>
     struct task<void> {
         struct promise_type{
-            friend class task;
             CancelHandle cancelhandle;
             std::coroutine_handle<> waiter = nullptr;
 
@@ -497,7 +495,6 @@ namespace xnet{
 
                 auto await_suspend(std::coroutine_handle<> caller) noexcept {
                     h.promise().waiter = caller;
-                    // if(!h.done()) h.resume();
                     return h;
                 }
 
@@ -506,9 +503,160 @@ namespace xnet{
             return awaiter{h};
         }
     };
-#ifdef XNET_DISABLE_THREAD_SAFE
+
+    template<typename T = void>
+    struct ptask {
+        struct promise_type {
+            std::coroutine_handle<> waiter = nullptr;
+            T value{};
+
+            ptask<T> get_return_object() {
+                return ptask<T>{
+                    std::coroutine_handle<promise_type>::from_promise(*this)
+                };
+            }
+
+            std::suspend_always initial_suspend() noexcept { return {}; }
+
+            auto final_suspend() noexcept{
+                struct awaiter{
+                    bool await_ready() const noexcept { return false; }
+                    std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept{
+                        auto w = h.promise().waiter;
+                        return w ? w : std::noop_coroutine();
+                    }
+
+                    void await_resume() const noexcept {}
+                };
+                return awaiter{};
+            }
+
+            void return_value(T&& v) noexcept {
+                value = std::move(v);
+            }
+
+            void unhandled_exception() noexcept {}
+        };
+
+        std::coroutine_handle<promise_type> h = nullptr;
+
+        ptask(std::coroutine_handle<promise_type> h) : h(h) {}
+        ptask(ptask&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
+        void operator=(ptask&& other) noexcept{
+            if(this->h) this->h.destroy();
+            this->h = std::exchange(other.h, nullptr);
+        }
+        ptask(const ptask&) = delete;
+
+        ~ptask() {
+            if (h){
+                h.destroy();
+            }
+        }
+
+        void start() & noexcept { 
+            h.resume();
+        }
+        void start() && noexcept = delete;
+
+        bool pending() const noexcept { return this->h != nullptr; }
+
+        auto operator co_await() {
+            struct awaiter {
+                std::coroutine_handle<promise_type> h;
+
+                bool await_ready() const noexcept {
+                    return !h || h.done();
+                }
+
+                auto await_suspend(std::coroutine_handle<> caller) noexcept {
+                    h.promise().waiter = caller;
+                    return h;
+                }
+
+                T await_resume() noexcept {
+                    return std::move(h.promise().value);
+                }
+            };
+            return awaiter{h};
+        }
+    };
+
+    template<>
+    struct ptask<void> {
+        struct promise_type{
+            std::coroutine_handle<> waiter = nullptr;
+
+            ptask<void> get_return_object() {
+                return ptask<void>{
+                    std::coroutine_handle<promise_type>::from_promise(*this)
+                };
+            }
+
+            std::suspend_always initial_suspend() noexcept { return {}; }
+
+            auto final_suspend() noexcept{
+                struct awaiter{
+                    bool await_ready() const noexcept { return false; }
+                    std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept{
+                        auto w = h.promise().waiter;
+                        return w ? w : std::noop_coroutine();
+                    }
+
+                    void await_resume() const noexcept {}
+                };
+                return awaiter{};
+            }
+
+            void return_void() noexcept {}
+
+            void unhandled_exception() noexcept {}
+        };
+
+        std::coroutine_handle<promise_type> h;
+
+        ptask(std::coroutine_handle<promise_type> h) : h(h) {}
+        ptask(ptask&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
+        void operator=(ptask&& other) noexcept{
+            if(this->h) this->h.destroy();
+            this->h = std::exchange(other.h, nullptr);
+        }
+        ptask(const ptask&) = delete;
+
+        ~ptask() {
+            if (h){
+                h.destroy();
+            }
+        }
+
+        void start() & noexcept { 
+            h.resume();
+        }
+        void start() && noexcept = delete;
+
+        bool pending() const noexcept { return this->h != nullptr; }
+
+        auto operator co_await() {
+            struct awaiter {
+                std::coroutine_handle<promise_type> h;
+
+                bool await_ready() const noexcept {
+                    return !h || h.done();
+                }
+
+                auto await_suspend(std::coroutine_handle<> caller) noexcept {
+                    h.promise().waiter = caller;
+                    return h;
+                }
+
+                void await_resume() noexcept {}
+            };
+            return awaiter{h};
+        }
+    };
+
     namespace details{
-        template<bool fastfail, class... Ops>
+        template<bool multi_threaded, bool fastfail, class... Ops>
         class [[nodiscard]] AllAwaiter{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
@@ -601,7 +749,7 @@ namespace xnet{
         };
 
 
-        template<bool fastfail, class... Ops>
+        template<bool multi_threaded, bool fastfail, class... Ops>
         class [[nodiscard]] AnyAwaiter{
             template<class... Ts>
             class Result{
@@ -750,13 +898,10 @@ namespace xnet{
             }
         };
     };
-#endif
 
-
-#ifndef XNET_DISABLE_THREAD_SAFE
     namespace details{
         template<bool fastfail, class... Ops>
-        class [[nodiscard]] AllAwaiter{
+        class [[nodiscard]] AllAwaiter<true, fastfail, Ops...>{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
                 if constexpr(i < num_ops){
@@ -873,7 +1018,7 @@ namespace xnet{
         };
 
         template<bool fastfail, class... Ops>
-        class [[nodiscard]] AnyAwaiter{
+        class [[nodiscard]] AnyAwaiter<true, fastfail, Ops...>{
             template<class... Ts>
             class Result{
                 friend class AnyAwaiter;
@@ -1045,30 +1190,34 @@ namespace xnet{
             }
         };
     };
-#endif
 
-    template<class... Ops>
-    details::AnyAwaiter<true, Ops...> race(Ops&&... ops) noexcept{
+    template<bool multi_threaded = true, class... Ops>
+    auto race(Ops&&... ops) noexcept{
         static_assert(sizeof...(Ops) != 0, "race(Ops&&...): Please provide the arguments!");
-        return details::AnyAwaiter<true, Ops...>(std::forward<Ops>(ops)...);
+        return details::AnyAwaiter<multi_threaded, true, Ops...>(std::forward<Ops>(ops)...);
     }
 
-    template<class... Ops>
-    details::AnyAwaiter<false, Ops...>any(Ops&&... ops) noexcept{
+    template<bool multi_threaded = true, class... Ops>
+    auto any(Ops&&... ops) noexcept{
         static_assert(sizeof...(Ops) != 0, "any(Ops&&...): Please provide the arguments!");
-        return details::AnyAwaiter<false, Ops...>(std::forward<Ops>(ops)...);
+        return details::AnyAwaiter<multi_threaded, false, Ops...>(std::forward<Ops>(ops)...);
     }
 
-    template<class... Ops>
-    details::AllAwaiter<true, Ops...> all(Ops&&... ops) noexcept{
+    template<bool multi_threaded = true, class... Ops>
+    auto all(Ops&&... ops) noexcept{
         static_assert(sizeof...(Ops) != 0, "all(Ops&&...): Please provide the arguments!");
-        return details::AllAwaiter<true, Ops...>(std::forward<Ops>(ops)...);
+        return details::AllAwaiter<multi_threaded, true, Ops...>(std::forward<Ops>(ops)...);
     }
 
-    template<class... Ops>
-    details::AllAwaiter<false, Ops...>allSettled(Ops&&... ops) noexcept{
+    template<bool multi_threaded = true, class... Ops>
+    auto allSettled(Ops&&... ops) noexcept{
         static_assert(sizeof...(Ops) != 0, "allSettled(Ops&&...): Please provide the arguments!");
-        return details::AllAwaiter<false, Ops...>(std::forward<Ops>(ops)...);
+        return details::AllAwaiter<multi_threaded, false, Ops...>(std::forward<Ops>(ops)...);
+    }
+
+    template<class T>
+    xnet::detached_task fire(T awaitable) noexcept{
+        co_await awaitable;
     }
 
     inline sockaddr_in v4addr(const char* ip, uint16_t port) noexcept {
