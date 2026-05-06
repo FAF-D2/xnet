@@ -350,6 +350,11 @@ namespace xnet{
                 return awaiter{};
             }
 
+            template<class V>
+            void return_value(V&& v) noexcept{
+                value = std::forward<V>(v);
+            }
+
             void return_value(T&& v) noexcept {
                 value = std::move(v);
             }
@@ -529,6 +534,11 @@ namespace xnet{
                     void await_resume() const noexcept {}
                 };
                 return awaiter{};
+            }
+
+            template<class V>
+            void return_value(V&& v) noexcept{
+                value = std::forward<V>(v);
             }
 
             void return_value(T&& v) noexcept {
