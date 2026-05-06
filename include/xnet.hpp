@@ -307,7 +307,8 @@ namespace xnet{
 
     struct detached_task {
         struct promise_type {
-            detached_task get_return_object() { return {}; }
+            detached_task get_return_object() noexcept { return {}; }
+            static detached_task get_return_object_on_allocation_failure() noexcept { return {}; }
 
             std::suspend_never initial_suspend() noexcept { return {}; }
             std::suspend_never final_suspend() noexcept { return {}; }
@@ -329,10 +330,14 @@ namespace xnet{
                 this->cancelhandle = io->cancelhandle();
             }
 
-            task<T> get_return_object() {
+            task<T> get_return_object() noexcept {
                 return task<T>{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
+            }
+
+            static task<T> get_return_object_on_allocation_failure() noexcept{
+                return task<T>{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -364,7 +369,7 @@ namespace xnet{
 
         std::coroutine_handle<promise_type> h = nullptr;
 
-        task(std::coroutine_handle<promise_type> h) : h(h) {}
+        task(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
         task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(task&& other) noexcept{
             if(this->h) this->h.destroy();
@@ -383,7 +388,7 @@ namespace xnet{
         }
         void start() && noexcept = delete;
 
-        bool pending() const noexcept { return this->h != nullptr; }
+        bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
             bool suspended = (h != nullptr);
@@ -397,7 +402,7 @@ namespace xnet{
             return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
         }
 
-        auto operator co_await() {
+        auto operator co_await() noexcept {
             struct awaiter {
                 std::coroutine_handle<promise_type> h;
 
@@ -429,10 +434,14 @@ namespace xnet{
                 this->cancelhandle = io->cancelhandle();
             }
 
-            task<void> get_return_object() {
+            task<void> get_return_object() noexcept {
                 return task<void>{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
+            }
+
+            static task<void> get_return_object_on_allocation_failure() noexcept{
+                return task<void>{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -457,7 +466,7 @@ namespace xnet{
 
         std::coroutine_handle<promise_type> h;
 
-        task(std::coroutine_handle<promise_type> h) : h(h) {}
+        task(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
         task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(task&& other) noexcept{
             if(this->h) this->h.destroy();
@@ -476,7 +485,7 @@ namespace xnet{
         }
         void start() && noexcept = delete;
 
-        bool pending() const noexcept { return this->h != nullptr; }
+        bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
             bool suspended = (h != nullptr);
@@ -490,7 +499,7 @@ namespace xnet{
             return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
         }
         
-        auto operator co_await() {
+        auto operator co_await() noexcept {
             struct awaiter {
                 std::coroutine_handle<promise_type> h;
 
@@ -515,10 +524,14 @@ namespace xnet{
             std::coroutine_handle<> waiter = nullptr;
             T value{};
 
-            ptask<T> get_return_object() {
+            ptask<T> get_return_object() noexcept {
                 return ptask<T>{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
+            }
+
+            static ptask<T> get_return_object_on_allocation_failure() noexcept{
+                return ptask<T>{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -550,7 +563,7 @@ namespace xnet{
 
         std::coroutine_handle<promise_type> h = nullptr;
 
-        ptask(std::coroutine_handle<promise_type> h) : h(h) {}
+        ptask(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
         ptask(ptask&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(ptask&& other) noexcept{
             if(this->h) this->h.destroy();
@@ -569,9 +582,9 @@ namespace xnet{
         }
         void start() && noexcept = delete;
 
-        bool pending() const noexcept { return this->h != nullptr; }
+        bool invalid() const noexcept { return this->h == nullptr; }
 
-        auto operator co_await() {
+        auto operator co_await() noexcept {
             struct awaiter {
                 std::coroutine_handle<promise_type> h;
 
@@ -597,10 +610,14 @@ namespace xnet{
         struct promise_type{
             std::coroutine_handle<> waiter = nullptr;
 
-            ptask<void> get_return_object() {
+            ptask<void> get_return_object() noexcept {
                 return ptask<void>{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
+            }
+
+            static ptask<void> get_return_object_on_allocation_failure() noexcept{
+                return ptask<void>{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -625,7 +642,7 @@ namespace xnet{
 
         std::coroutine_handle<promise_type> h;
 
-        ptask(std::coroutine_handle<promise_type> h) : h(h) {}
+        ptask(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
         ptask(ptask&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(ptask&& other) noexcept{
             if(this->h) this->h.destroy();
@@ -644,9 +661,9 @@ namespace xnet{
         }
         void start() && noexcept = delete;
 
-        bool pending() const noexcept { return this->h != nullptr; }
+        bool invalid() const noexcept { return this->h == nullptr; }
 
-        auto operator co_await() {
+        auto operator co_await() noexcept {
             struct awaiter {
                 std::coroutine_handle<promise_type> h;
 
@@ -748,7 +765,7 @@ namespace xnet{
 
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) {
+            void await_suspend(std::coroutine_handle<> handle) noexcept {
                 this->handler = handle;
                 return this->start_all_tasks();
             }
@@ -898,7 +915,7 @@ namespace xnet{
 
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) {
+            void await_suspend(std::coroutine_handle<> handle) noexcept {
                 this->handler = handle;
                 return this->start_all_tasks();
             }
@@ -1017,7 +1034,7 @@ namespace xnet{
 
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) {
+            void await_suspend(std::coroutine_handle<> handle) noexcept {
                 this->handler = handle;
                 return this->start_all_tasks();
             }
@@ -1190,7 +1207,7 @@ namespace xnet{
 
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) {
+            void await_suspend(std::coroutine_handle<> handle) noexcept {
                 this->handler = handle;
                 return this->start_all_tasks();
             }
@@ -1583,8 +1600,8 @@ namespace xnet{
 
                     AsyncStream& sender() noexcept{ return this->stream; }
                     bool pending() const noexcept { return this->handler != nullptr; }
-                    std::coroutine_handle<>& handle() { return this->handler; }
-                    CancelHandle cancelhandle(){ return CancelHandle(this); }
+                    std::coroutine_handle<>& handle() noexcept{ return this->handler; }
+                    CancelHandle cancelhandle() noexcept{ return CancelHandle(this); }
 
 
                     details::io_result<bool> cancel() noexcept{
@@ -1662,8 +1679,8 @@ namespace xnet{
 
                 AsyncStream& sender() noexcept{ return this->stream; }
                 bool pending() const noexcept { return this->handler != nullptr; }
-                std::coroutine_handle<>& handle() { return this->handler; }
-                CancelHandle cancelhandle(){ return CancelHandle(this); }
+                std::coroutine_handle<>& handle() noexcept { return this->handler; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) & noexcept{ 
                     return IOTimeoutAwaiter(this->stream, s, ns, this->args); 
@@ -1970,8 +1987,8 @@ namespace xnet{
 
                     AsyncAccepter& sender() noexcept { return this->accepter; }
                     bool pending() const noexcept { return this->handler != nullptr; }
-                    std::coroutine_handle<>& handle() { return this->handler; }
-                    CancelHandle cancelhandle() { return CancelHandle(this); }
+                    std::coroutine_handle<>& handle() noexcept { return this->handler; }
+                    CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
 
                     details::io_result<bool> cancel() noexcept{
                         using func_type = decltype(io_uring_prep_cancel);
@@ -2050,8 +2067,8 @@ namespace xnet{
 
                 AsyncAccepter& sender() noexcept { return this->accepter; }
                 bool pending() const noexcept { return this->handler != nullptr; }
-                std::coroutine_handle<>& handle() { return this->handler; }
-                CancelHandle cancelhandle() { return CancelHandle(this); }
+                std::coroutine_handle<>& handle() noexcept { return this->handler; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) const noexcept{ 
                     return AcceptTimeoutAwaiter(this->accepter, s, ns); 
@@ -2187,8 +2204,8 @@ namespace xnet{
 
                 AsyncTimer& sender() noexcept { return this->timer; }
                 bool pending() const noexcept { return this->handler != nullptr; }
-                std::coroutine_handle<>& handle() { return this->handler; }
-                CancelHandle cancelhandle() { return CancelHandle(this); }
+                std::coroutine_handle<>& handle() noexcept { return this->handler; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
 
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_timeout_remove);
@@ -2314,8 +2331,8 @@ namespace xnet{
 
                 AsyncFileSystem& sender(){ return this->filesystem; }
                 bool pending() const noexcept { return this->handler != nullptr; }
-                std::coroutine_handle<>& handle(){ return this->handler; }
-                CancelHandle cancelhandle() { return CancelHandle(this); }
+                std::coroutine_handle<>& handle() noexcept { return this->handler; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
 
                 
                 details::io_result<bool> cancel() noexcept{
