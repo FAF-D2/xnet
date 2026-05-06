@@ -1354,6 +1354,14 @@ namespace xnet{
                 ring.ring_fd = -1;
             }
         }
+
+        io_context(unsigned entries, struct io_uring_params* params) noexcept: ring{}, evs_count(0){
+            int err = io_uring_queue_init_params(entries, &ring, params);
+            if (err < 0) {
+                ring.ring_fd = -1;
+            }
+        }
+
         io_context(const io_context&) = delete;
 
         ~io_context(){
@@ -1444,6 +1452,39 @@ namespace xnet{
             }
         }
 
+        // basic scheduler for simplicity
+        void run_until_complete() noexcept{
+            constexpr size_t CQE_BATCH = 512;
+            io_uring_cqe* cqes[CQE_BATCH];
+            if(this->evs_count == 0){
+                return;
+            }
+
+            this->submit_and_wait();
+            int& result_slot = xnet::io_context::result();
+            while(true){
+                unsigned int count = io_uring_peek_batch_cqe(&this->ring, cqes, CQE_BATCH);
+                for(unsigned int i = 0; i < count; i++){
+                    io_uring_cqe* cqe = cqes[i];
+                    auto handle = std::coroutine_handle<>::from_address(
+                        (void*)io_uring_cqe_get_data64(cqe)
+                    );
+                    if(handle){
+                        result_slot = cqe->res;
+                        handle.resume();
+                    }
+                    if((i + 1) % 256 == 0){
+                        this->submit();
+                    }
+                }
+                io_uring_cq_advance(&this->ring, count);
+                if(this->evs_count == 0){
+                    return;
+                }
+                this->submit_and_wait();
+            }
+        }
+
         template<int xdomain, int xtype, bool client>
         class AsyncStream;
         using v4TCPServer = AsyncStream<AF_INET, SOCK_STREAM, false>;
@@ -1500,14 +1541,14 @@ namespace xnet{
                 static_assert(judge,
                 "AsyncStream::AsyncStream(io_context&, const addr_type*) only UDP, STDXXXs and TCPClient can use this constructor");
                 if constexpr(isstdin || isstdout || isstderr){
-                    int oldopt = fcntl(this->stream, F_GETFL);
-                    if(oldopt >= 0 && fcntl(this->stream, F_SETFL, oldopt | O_NONBLOCK) != SOCKET_ERROR){
-                        return;
-                    }
-                    this->stream = INVALID_HANDLE;
+                    // int oldopt = fcntl(this->stream, F_GETFL);
+                    // if(oldopt >= 0 && fcntl(this->stream, F_SETFL, oldopt | O_NONBLOCK) != SOCKET_ERROR){
+                    //     return;
+                    // }
+                    // this->stream = INVALID_HANDLE;
                 }
                 else{
-                    this->stream = socket(domain, type | SOCK_NONBLOCK, 0);
+                    this->stream = socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                     if(this->stream != INVALID_HANDLE){
                         if constexpr(AsyncStream::istcp){
                             // tcp client
@@ -1850,7 +1891,7 @@ namespace xnet{
                 static_assert(AsyncStream::isclient, 
                 "AysncStream<>::connect(...): only client can use this function.");
                 if(this->stream == INVALID_HANDLE){ 
-                    this->stream = socket(domain, type | SOCK_NONBLOCK, 0);
+                    this->stream = socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                     if constexpr(AsyncStream ::istcp){
                         if(this->stream != INVALID_HANDLE){
                             int one = 1;
@@ -1925,7 +1966,7 @@ namespace xnet{
             using tcp_type = AsyncStream<domain, type, false>;
 
             AsyncAccepter(io_context& ctx, const addr_type& addr, bool reuseport = false, int maxlisten=SOMAXCONN)
-            noexcept: ctx(&ctx), server(socket(domain, type | SOCK_NONBLOCK, 0))
+            noexcept: ctx(&ctx), server(socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0))
             {
                 static_assert(xtype == SOCK_STREAM || xtype == SOCK_SEQPACKET, 
                 "AsyncAccepter<xdomain, xtype>::AsyncAccepter(io_context&, uint16_t, const addr_type&, int): only accept SOCK_STREAM or SOCK_SEQPACKET type.");
@@ -2013,7 +2054,7 @@ namespace xnet{
                             io_uring_sqe* sqe1 = io_uring_get_sqe(&this->accepter.ctx->ring);
                             io_uring_sqe* sqe2 = io_uring_get_sqe(&this->accepter.ctx->ring);
 
-                            io_uring_prep_accept(sqe1, this->accepter.server, nullptr, nullptr, SOCK_NONBLOCK);
+                            io_uring_prep_accept(sqe1, this->accepter.server, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
                             io_uring_sqe_set_flags(sqe1, IOSQE_IO_LINK);
                             io_uring_sqe_set_data(sqe1, h.address());
                             io_uring_prep_link_timeout(sqe2, &this->ts, XNET_ETIME_SUCCESS);
@@ -2094,7 +2135,7 @@ namespace xnet{
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->accepter.ctx->ring);
                     auto& result = io_context::result();
                     if(sqe != nullptr){
-                        io_uring_prep_accept(sqe, this->accepter.server, nullptr, nullptr, SOCK_NONBLOCK);
+                        io_uring_prep_accept(sqe, this->accepter.server, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
                         io_uring_sqe_set_data(sqe, h.address());
 
                         this->handler = h;
