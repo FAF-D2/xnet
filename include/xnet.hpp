@@ -277,7 +277,13 @@ namespace xnet{
         {}
 
         details::io_result<bool> cancel() noexcept;
+        CancelHandle& async_cancel() noexcept { return *this; }
+        
         bool invalid() const noexcept { return this->target == nullptr; }
+
+        bool await_ready() const noexcept;
+        bool await_suspend(std::coroutine_handle<> caller) noexcept;
+        details::io_result<bool> await_resume() noexcept;
     };
 
     struct CancelChain{
@@ -387,6 +393,10 @@ namespace xnet{
             return {false, EAGAIN};
         }
 
+        CancelHandle& async_cancel() noexcept{
+            return this->h.promise().chain.cancelhandle;
+        }
+
         bool await_ready() const noexcept{
             return !h || h.done();
         }
@@ -484,6 +494,10 @@ namespace xnet{
                 return {false, ECANCELED};
             }
             return {false, EAGAIN};
+        }
+
+        CancelHandle& async_cancel() noexcept {
+            return this->h.promise().chain.cancelhandle;
         }
 
         bool await_ready() const noexcept{
@@ -1621,7 +1635,7 @@ namespace xnet{
                             using func_type = decltype(io_uring_prep_poll_remove);
                             using data_type = unsigned long long;
                             return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
-                                *this->timer.ctx, this->handler
+                                *this->stream.ctx, this->handler
                             );
                         }
                         using func_type = decltype(io_uring_prep_cancel);
@@ -1630,6 +1644,7 @@ namespace xnet{
                             *this->stream.ctx, this->handler
                         );
                     }
+                    CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                     bool await_ready() noexcept{ return false; }
 
@@ -1713,7 +1728,7 @@ namespace xnet{
                         using func_type = decltype(io_uring_prep_poll_remove);
                         using data_type = unsigned long long;
                         return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
-                            *this->timer.ctx, this->handler
+                            *this->stream.ctx, this->handler
                         );
                     }
 
@@ -1723,6 +1738,7 @@ namespace xnet{
                         *this->stream.ctx, this->handler
                     );
                 }
+                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept{ return false; }
 
@@ -2024,6 +2040,7 @@ namespace xnet{
                             *this->accepter.ctx, this->handler
                         );
                     }
+                    CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                     bool await_ready() const noexcept{ return false; }
 
@@ -2108,6 +2125,7 @@ namespace xnet{
                         *this->accepter.ctx, this->handler
                     );
                 }
+                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() const noexcept{ return false; }
 
@@ -2241,6 +2259,7 @@ namespace xnet{
                         *this->timer.ctx, this->handler
                     );
                 }
+                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept{ 
                     if(this->ts.tv_sec != 0 || this->ts.tv_nsec != 0){
@@ -2361,7 +2380,6 @@ namespace xnet{
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
                 CancelHandle cancelhandle() noexcept { return CancelHandle{this->filesystem.ctx, this->handler}; }
 
-                
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
@@ -2369,6 +2387,7 @@ namespace xnet{
                         *this->filesystem.ctx, this->handler
                     );
                 }
+                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -2469,6 +2488,31 @@ namespace xnet{
         return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
             *this->ctx, this->target
         );
+    }
+
+    inline bool CancelHandle::await_ready() const noexcept{
+        bool suspended = this->target != nullptr;
+        if(!suspended){
+            io_context::result() = -EAGAIN;
+        }
+        return !suspended;
+    }
+
+    inline bool CancelHandle::await_suspend(std::coroutine_handle<> caller) noexcept{
+        using func_type = decltype(io_uring_prep_cancel);
+        using data_type = void*;
+        auto submitted = io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+            *this->ctx, this->target, caller
+        );
+        if(!submitted){
+            io_context::result() = -submitted.err;
+        }
+        return *submitted;
+    }
+
+    inline details::io_result<bool> CancelHandle::await_resume() noexcept{
+        int res = io_context::result();
+        return { res >= 0, res < 0 ? -res : 0 };
     }
 
     template<int xdomain, int xtype>
