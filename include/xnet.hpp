@@ -181,6 +181,16 @@ namespace xnet{
         struct args_traits<decltype(&::io_uring_prep_symlinkat), ::io_uring_prep_symlinkat>{
             using args_type = std::tuple<const char*, int, const char*>;
         };
+
+        template<auto func>
+        struct is_poll_add{
+            static constexpr bool value = false;
+        };
+
+        template<>
+        struct is_poll_add<::io_uring_prep_poll_add>{
+            static constexpr bool value = true;
+        };
     };
 
     namespace details{
@@ -255,56 +265,27 @@ namespace xnet{
         };
     };
 
-    // Fat Pointer
     struct CancelHandle{
-        template<class T>
-        static details::io_result<bool> call_traits(void* p) noexcept{
-            return (*static_cast<T*>(p)).cancel();
-        }
-
-        typedef details::io_result<bool>(*Call)(void*);
-
-        Call call_func;
-        // void* p;
-        details::atomic_type<void*> p;
+        io_context* ctx;
+        std::coroutine_handle<> target;
     public:
         CancelHandle() = default;
         ~CancelHandle() = default;
-        template<class T>
-        CancelHandle(T* t) noexcept: call_func(call_traits<T>), p(t)
-        {}
-    
-    #ifdef XNET_DISABLE_THREAD_SAFE
         CancelHandle(const CancelHandle&) = default;
         CancelHandle& operator=(const CancelHandle& other) = default;
-
-        details::io_result<bool> cancel() noexcept{ return this->call_func(this->p); }
-        bool invalid() const noexcept { return this->p == nullptr; }
-        void reset() noexcept{
-            this->p = nullptr;
-        }
-    #else
-        CancelHandle(const CancelHandle& other) 
-        noexcept: call_func(other.call_func), p(other.p.load(std::memory_order_acquire))
+        CancelHandle(io_context* ctx, std::coroutine_handle<> h) noexcept: ctx(ctx), target(h)
         {}
-        CancelHandle& operator=(const CancelHandle& other) noexcept {
-            call_func = other.call_func;
-            void* ptr = other.p.load(std::memory_order_acquire);
-            p.store(ptr, std::memory_order_release);
-            return *this;
-        }
 
-        details::io_result<bool> cancel() noexcept{ return this->call_func(this->p.load(std::memory_order_acquire)); }
-        bool invalid() const noexcept { return p.load(std::memory_order_acquire) == nullptr; }
-        void reset() noexcept{
-            p.store(nullptr, std::memory_order_release);
-        }
-    #endif
-
-        template<class T>
-        static CancelHandle make_handle(T* t) noexcept { return CancelHandle(t); }
+        details::io_result<bool> cancel() noexcept;
+        bool invalid() const noexcept { return this->target == nullptr; }
     };
 
+    struct CancelChain{
+        CancelHandle cancelhandle;
+        CancelChain* father = nullptr;
+    };
+
+    // Fat Pointer
     struct detached_task {
         struct promise_type {
             detached_task get_return_object() noexcept { return {}; }
@@ -321,13 +302,18 @@ namespace xnet{
     template<typename T = void>
     struct task {
         struct promise_type {
-            CancelHandle cancelhandle;
+            CancelChain chain;
             std::coroutine_handle<> waiter = nullptr;
             T value{};
 
             template<class IO>
             void xcoro_hook(IO* io) noexcept{
-                this->cancelhandle = io->cancelhandle();
+                auto handle = io->cancelhandle();
+                CancelChain* block = &this->chain;
+                while(block){
+                    block->cancelhandle = handle;
+                    block = block->father;
+                }
             }
 
             task<T> get_return_object() noexcept {
@@ -391,47 +377,49 @@ namespace xnet{
         bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            bool suspended = (h != nullptr);
-            bool notfinished = (!h.done());
-            bool awaiting_io_awaiter = !h.promise().cancelhandle.invalid();
-            if(suspended && notfinished && awaiting_io_awaiter){
-                auto handle = this->h.promise().cancelhandle;
-                this->h.promise().cancelhandle.reset();
-                return handle.cancel();
+            auto& handle = h.promise().chain.cancelhandle;
+            if(!handle.invalid()){
+                if(!h.done()){
+                    return handle.cancel();
+                }
+                return {false, ECANCELED};
             }
-            return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
+            return {false, EAGAIN};
         }
 
-        auto operator co_await() noexcept {
-            struct awaiter {
-                std::coroutine_handle<promise_type> h;
+        bool await_ready() const noexcept{
+            return !h || h.done();
+        }
 
-                bool await_ready() const noexcept {
-                    return !h || h.done();
-                }
+        template<class Promise>
+        auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
+            auto& promise = h.promise();
+            if constexpr(requires{ promise.chain.father = &caller.promise().chain; }){
+                promise.chain.father = &caller.promise().chain;
+            }
+            promise.waiter = caller;
+            return h;
+        }
 
-                auto await_suspend(std::coroutine_handle<> caller) noexcept {
-                    h.promise().waiter = caller;
-                    return h;
-                }
-
-                T await_resume() noexcept {
-                    return std::move(h.promise().value);
-                }
-            };
-            return awaiter{h};
+        T await_resume() noexcept{
+            return std::move(h.promise().value);
         }
     };
 
     template<>
     struct task<void> {
         struct promise_type{
-            CancelHandle cancelhandle;
+            CancelChain chain;
             std::coroutine_handle<> waiter = nullptr;
 
             template<class IO>
             void xcoro_hook(IO* io) noexcept{
-                this->cancelhandle = io->cancelhandle();
+                auto handle = io->cancelhandle();
+                CancelChain* block = &this->chain;
+                while(block){
+                    block->cancelhandle = handle;
+                    block = block->father;
+                }
             }
 
             task<void> get_return_object() noexcept {
@@ -488,34 +476,31 @@ namespace xnet{
         bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            bool suspended = (h != nullptr);
-            bool notfinished = (!h.done());
-            bool awaiting_io_awaiter = !h.promise().cancelhandle.invalid();
-            if(suspended && notfinished && awaiting_io_awaiter){
-                auto handle = this->h.promise().cancelhandle;
-                this->h.promise().cancelhandle.reset();
-                return handle.cancel();
+            auto& handle = h.promise().chain.cancelhandle;
+            if(!handle.invalid()){
+                if(!h.done()){
+                    return handle.cancel();
+                }
+                return {false, ECANCELED};
             }
-            return details::io_result<bool>(false, !notfinished ? ECANCELED : EAGAIN);
+            return {false, EAGAIN};
         }
-        
-        auto operator co_await() noexcept {
-            struct awaiter {
-                std::coroutine_handle<promise_type> h;
 
-                bool await_ready() const noexcept {
-                    return !h || h.done();
-                }
-
-                auto await_suspend(std::coroutine_handle<> caller) noexcept {
-                    h.promise().waiter = caller;
-                    return h;
-                }
-
-                void await_resume() noexcept {}
-            };
-            return awaiter{h};
+        bool await_ready() const noexcept{
+            return !h || h.done();
         }
+
+        template<class Promise>
+        auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
+            auto& promise = h.promise();
+            if constexpr(requires{ promise.chain.father = &caller.promise().chain; }){
+                promise.chain.father = &caller.promise().chain;
+            }
+            promise.waiter = caller;
+            return h;
+        }
+
+        void await_resume() noexcept{}
     };
 
     template<typename T = void>
@@ -584,24 +569,17 @@ namespace xnet{
 
         bool invalid() const noexcept { return this->h == nullptr; }
 
-        auto operator co_await() noexcept {
-            struct awaiter {
-                std::coroutine_handle<promise_type> h;
+        bool await_ready() const noexcept {
+            return !h || h.done();
+        }
 
-                bool await_ready() const noexcept {
-                    return !h || h.done();
-                }
+        auto await_suspend(std::coroutine_handle<> caller) noexcept {
+            h.promise().waiter = caller;
+            return h;
+        }
 
-                auto await_suspend(std::coroutine_handle<> caller) noexcept {
-                    h.promise().waiter = caller;
-                    return h;
-                }
-
-                T await_resume() noexcept {
-                    return std::move(h.promise().value);
-                }
-            };
-            return awaiter{h};
+        T await_resume() noexcept {
+            return std::move(h.promise().value);
         }
     };
 
@@ -663,23 +641,16 @@ namespace xnet{
 
         bool invalid() const noexcept { return this->h == nullptr; }
 
-        auto operator co_await() noexcept {
-            struct awaiter {
-                std::coroutine_handle<promise_type> h;
-
-                bool await_ready() const noexcept {
-                    return !h || h.done();
-                }
-
-                auto await_suspend(std::coroutine_handle<> caller) noexcept {
-                    h.promise().waiter = caller;
-                    return h;
-                }
-
-                void await_resume() noexcept {}
-            };
-            return awaiter{h};
+        bool await_ready() const noexcept {
+            return !h || h.done();
         }
+
+        auto await_suspend(std::coroutine_handle<> caller) noexcept {
+            h.promise().waiter = caller;
+            return h;
+        }
+
+        void await_resume() noexcept {}
     };
 
     namespace details{
@@ -1323,28 +1294,6 @@ namespace xnet{
         #ifndef XNET_DISABLE_THREAD_SAFE
         std::atomic_flag spinlock = ATOMIC_FLAG_INIT;
         #endif
-
-        template<class T, class F, F cancelFunc, class data_type = void*>
-        static details::io_result<bool> cancel(T& async_type, std::coroutine_handle<> handler) noexcept{
-            if(handler != nullptr){
-                if constexpr(details::THREAD_SAFE_REQUIRED){
-                    async_type.ctx->lock();
-                }
-                io_uring_sqe* sqe = io_uring_get_sqe(&async_type.ctx->ring);
-                bool submitted = false;
-                if(sqe != nullptr){
-                    cancelFunc(sqe, (data_type)handler.address(), 0);
-                    XNET_SET_FLAGS_SKIP_SUCCESS(sqe);
-                    io_uring_sqe_set_data(sqe, nullptr);
-                    submitted = true;
-                }
-                if constexpr(details::THREAD_SAFE_REQUIRED){
-                    async_type.ctx->unlock();
-                }
-                return details::io_result<bool>(submitted, submitted ? 0 : EAGAIN);
-            }
-            return details::io_result<bool>(false, EAGAIN);
-        }
     public:
         static constexpr unsigned int default_flags = IORING_SETUP_CLAMP;
 
@@ -1368,6 +1317,28 @@ namespace xnet{
             if(ring.ring_fd != -1){
                 io_uring_queue_exit(&ring);
             }
+        }
+
+        template<class F, F cancelFunc, class data_type = void*>
+        static details::io_result<bool> cancel(io_context& ctx, std::coroutine_handle<> target, std::coroutine_handle<> callback = nullptr) noexcept{
+            if(target != nullptr){
+                if constexpr(details::THREAD_SAFE_REQUIRED){
+                    ctx.lock();
+                }
+                io_uring_sqe* sqe = io_uring_get_sqe(&ctx.ring);
+                bool submitted = false;
+                if(sqe != nullptr){
+                    cancelFunc(sqe, (data_type)target.address(), 0);
+                    XNET_SET_FLAGS_SKIP_SUCCESS(sqe);
+                    io_uring_sqe_set_data(sqe, callback.address());
+                    submitted = true;
+                }
+                if constexpr(details::THREAD_SAFE_REQUIRED){
+                    ctx.unlock();
+                }
+                return details::io_result<bool>(submitted, submitted ? 0 : EAGAIN);
+            }
+            return details::io_result<bool>(false, EAGAIN);
         }
 
         bool invalid() const noexcept { return ring.ring_fd == -1; }
@@ -1642,14 +1613,21 @@ namespace xnet{
                     AsyncStream& sender() noexcept{ return this->stream; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept{ return this->handler; }
-                    CancelHandle cancelhandle() noexcept{ return CancelHandle(this); }
+                    CancelHandle cancelhandle() noexcept{ return CancelHandle{this->stream.ctx, this->handler}; }
 
 
                     details::io_result<bool> cancel() noexcept{
+                        if constexpr(details::is_poll_add<prep_func>::value){
+                            using func_type = decltype(io_uring_prep_poll_remove);
+                            using data_type = unsigned long long;
+                            return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
+                                *this->timer.ctx, this->handler
+                            );
+                        }
                         using func_type = decltype(io_uring_prep_cancel);
                         using data_type = void*;
-                        return io_context::cancel<AsyncStream, func_type, io_uring_prep_cancel, data_type>(
-                            this->stream, this->handler
+                        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                            *this->stream.ctx, this->handler
                         );
                     }
 
@@ -1721,7 +1699,7 @@ namespace xnet{
                 AsyncStream& sender() noexcept{ return this->stream; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this->stream.ctx, this->handler}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) & noexcept{ 
                     return IOTimeoutAwaiter(this->stream, s, ns, this->args); 
@@ -1731,10 +1709,18 @@ namespace xnet{
                 }
 
                 details::io_result<bool> cancel() noexcept{
+                    if constexpr(details::is_poll_add<prep_func>::value){
+                        using func_type = decltype(io_uring_prep_poll_remove);
+                        using data_type = unsigned long long;
+                        return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
+                            *this->timer.ctx, this->handler
+                        );
+                    }
+
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<AsyncStream, func_type, io_uring_prep_cancel, data_type>(
-                        this->stream, this->handler
+                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                        *this->stream.ctx, this->handler
                     );
                 }
 
@@ -2029,13 +2015,13 @@ namespace xnet{
                     AsyncAccepter& sender() noexcept { return this->accepter; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                    CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
+                    CancelHandle cancelhandle() noexcept { return CancelHandle{this->accepter.ctx, this->handler}; }
 
                     details::io_result<bool> cancel() noexcept{
                         using func_type = decltype(io_uring_prep_cancel);
                         using data_type = void*;
-                        return io_context::cancel<AsyncAccepter, func_type, io_uring_prep_cancel, data_type>(
-                            this->accepter, this->handler
+                        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                            *this->accepter.ctx, this->handler
                         );
                     }
 
@@ -2109,7 +2095,7 @@ namespace xnet{
                 AsyncAccepter& sender() noexcept { return this->accepter; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this->accepter.ctx, this->handler}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) const noexcept{ 
                     return AcceptTimeoutAwaiter(this->accepter, s, ns); 
@@ -2118,8 +2104,8 @@ namespace xnet{
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<AsyncAccepter, func_type, io_uring_prep_cancel, data_type>(
-                        this->accepter, this->handler
+                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                        *this->accepter.ctx, this->handler
                     );
                 }
 
@@ -2246,13 +2232,13 @@ namespace xnet{
                 AsyncTimer& sender() noexcept { return this->timer; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this->timer.ctx, this->handler}; }
 
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_timeout_remove);
                     using data_type = unsigned long long;
-                    return io_context::cancel<AsyncTimer, func_type, io_uring_prep_timeout_remove, data_type>(
-                        this->timer, this->handler
+                    return io_context::cancel<func_type, io_uring_prep_timeout_remove, data_type>(
+                        *this->timer.ctx, this->handler
                     );
                 }
 
@@ -2373,14 +2359,14 @@ namespace xnet{
                 AsyncFileSystem& sender(){ return this->filesystem; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle(this); }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this->filesystem.ctx, this->handler}; }
 
                 
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<AsyncFileSystem, func_type, io_uring_prep_cancel, data_type>(
-                        this->filesystem, this->handler
+                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                        *this->filesystem.ctx, this->handler
                     );
                 }
 
@@ -2476,6 +2462,14 @@ namespace xnet{
             }
         };
     };
+
+    inline details::io_result<bool> CancelHandle::cancel() noexcept {
+        using func_type = decltype(io_uring_prep_cancel);
+        using data_type = void*;
+        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+            *this->ctx, this->target
+        );
+    }
 
     template<int xdomain, int xtype>
     using AsyncAccepter = io_context::AsyncAccepter<xdomain, xtype>;
