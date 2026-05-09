@@ -262,6 +262,10 @@ namespace xnet{
             int error() const noexcept{ return err; }
             operator bool() const noexcept { return err == 0; }
             bool cancelled() const noexcept { return this->err == ECANCELED; }
+            bool wouldblock() const noexcept { return this->err == EWOULDBLOCK; }
+            bool again() const noexcept { return this->err == EAGAIN; }
+            bool timed() const noexcept { return this->err == ETIME; }
+            bool rst() const noexcept { return this->err == ECONNRESET; }
         };
     };
 
@@ -291,7 +295,6 @@ namespace xnet{
         CancelChain* father = nullptr;
     };
 
-    // Fat Pointer
     struct detached_task {
         struct promise_type {
             detached_task get_return_object() noexcept { return {}; }
