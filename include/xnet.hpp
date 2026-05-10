@@ -676,7 +676,7 @@ namespace xnet{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
                 if constexpr(i < num_ops){
-                    if constexpr(i != hit){
+                    if constexpr(i != hit && requires{std::get<i>(ops).cancel();}){
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
@@ -708,20 +708,18 @@ namespace xnet{
                     std::get<worker_id>(awaiter.result) = std::move(result);
                     if(awaiter.done < 0){
                         --awaiter.done;
-                        need_resume = (-awaiter.done == num_ops);
                     }
                     else{
                         if(ok){
                             ++awaiter.done;
-                            need_resume = (awaiter.done == num_ops);
                         }
                         else{
                             // frist failure
                             awaiter.done = -(awaiter.done + 1);
                             need_cancel = true;
-                            need_resume = (-awaiter.done == num_ops);
                         }
                     }
+                    need_resume = (awaiter.done >= 0 ? awaiter.done : -awaiter.done) == num_ops;
 
                     if(need_cancel){
                         awaiter.cancel_except<worker_id, 0>(); 
@@ -810,7 +808,7 @@ namespace xnet{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
                 if constexpr(i < num_ops){
-                    if constexpr(i != hit){
+                    if constexpr(i != hit && requires{std::get<i>(ops).cancel();}){
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
@@ -862,7 +860,6 @@ namespace xnet{
 
                     if(awaiter.done > 0){
                         ++awaiter.done;
-                        need_resume = (awaiter.done == num_ops);
                     }
                     else{
                         if(ok){
@@ -872,13 +869,12 @@ namespace xnet{
                             using result_t = decltype(result);
                             new (&awaiter.result.bytes) result_t(std::move(result));
                             need_cancel = true;
-                            need_resume = (awaiter.done == num_ops);
                         }
                         else{
                             --awaiter.done;
-                            need_resume = (-awaiter.done == num_ops);
                         }
                     }
+                    need_resume = (awaiter.done >= 0 ? awaiter.done : -awaiter.done) == num_ops;
 
                     if(need_cancel){
                         awaiter.cancel_except<worker_id, 0>();
@@ -920,7 +916,7 @@ namespace xnet{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
                 if constexpr(i < num_ops){
-                    if constexpr(i != hit){
+                    if constexpr(i != hit && requires{std::get<i>(ops).cancel();}){
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
@@ -941,55 +937,36 @@ namespace xnet{
                 if constexpr(fastfail){
                     // all
                     // negative represents failure
-                    
                     static_assert(requires{result.error();}, 
                     "AllAwaiter<false, ...>::worker(): co_await result should have error() interface when enabling fastfail");
 
-                    // side effects
                     bool ok = !result.error();
                     bool need_cancel = false;
                     bool need_resume = false;
-                    
                     std::get<worker_id>(awaiter.result) = std::move(result);
                     int seen = awaiter.done.load(std::memory_order_acquire);
-                    if(seen < 0){
-                        seen = awaiter.done.fetch_sub(1, std::memory_order_acq_rel);
-                        need_resume = (1-seen) == num_ops;
-                    }
-                    else{
+
+                    while(true){
+                        int new_val;
                         if(ok){
-                            while(true){
-                                if(!awaiter.done.compare_exchange_weak(seen, seen + 1, std::memory_order_acq_rel)){
-                                    if(seen < 0){
-                                        seen = awaiter.done.fetch_sub(1, std::memory_order_acq_rel);
-                                        need_resume = (1 - seen == num_ops);
-                                        break;
-                                    }
-                                }
-                                else{
-                                    need_resume = (seen + 1 == num_ops);
-                                    break;
-                                }
-                            }
+                            new_val = (seen >= 0 ? seen + 1 : seen - 1);
                         }
                         else{
-                            while(true){
-                                if(!awaiter.done.compare_exchange_weak(seen, -(seen + 1), std::memory_order_acq_rel)){
-                                    if(seen < 0){
-                                        seen = awaiter.done.fetch_sub(1, std::memory_order_acq_rel);
-                                        need_resume = (1 - seen == num_ops);
-                                        break;
-                                    }
-                                }
-                                else{
-                                    need_cancel = true;
-                                    need_resume = (seen + 1 == num_ops);
-                                    break;
-                                }
+                            if(seen >= 0){
+                                new_val = -(seen + 1);
+                                need_cancel = true;
+                            }
+                            else{
+                                new_val = seen - 1;
                             }
                         }
+                        if(awaiter.done.compare_exchange_weak(seen, new_val, std::memory_order_acq_rel)){
+                            int completed = (new_val >= 0 ? new_val : -new_val);
+                            need_resume = completed == num_ops;
+                            break;
+                        }
                     }
-
+                    
                     if(need_cancel){
                         // only cancel once
                         awaiter.cancel_except<worker_id, 0>(); 
@@ -1000,13 +977,14 @@ namespace xnet{
                 }
                 else{
                     // allSettled
-                    int seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
                     std::get<worker_id>(awaiter.result) = std::move(result);
+                    int seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
                     bool need_resume = (seen + 1 == num_ops);
                     if(need_resume){
                         awaiter.handler.resume();
                     }
                 }
+                co_return;
             }
             std::tuple<Ops...> ops;
             std::tuple<await_result_t<Ops>...> result;
@@ -1078,7 +1056,7 @@ namespace xnet{
             template<size_t hit, size_t i>
             void cancel_except() noexcept{
                 if constexpr(i < num_ops){
-                    if constexpr(i != hit){
+                    if constexpr(i != hit && requires{std::get<i>(ops).cancel();}){
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
@@ -1096,7 +1074,6 @@ namespace xnet{
             template<size_t worker_id, class Op>
             static xnet::detached_task worker(AnyAwaiter& awaiter, Op& op) noexcept{
                 auto result = co_await op;
-
                 if constexpr(fastfail){
                     // race
                     // side effects
@@ -1125,54 +1102,38 @@ namespace xnet{
                     // postive represents success, <= 0 for error
                     static_assert(requires{result.error();}, 
                     "AnyAwaiter<false, ...>::worker(): co_await result should have error() interface when disabling fastfail");
-                    
+
                     // side effects
                     bool ok = !result.error();
                     bool need_cancel = false;
                     bool need_resume = false;
 
                     int seen = awaiter.done.load(std::memory_order_acquire);
-                    if(seen > 0){
-                        seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
-                        need_resume = (seen + 1 == num_ops);
-                    }
-                    else{
+                    while(true){
+                        int new_val;
                         if(ok){
-                            while(true){
-                                if(!awaiter.done.compare_exchange_weak(seen, 1 - seen, std::memory_order_acq_rel)){
-                                    if(seen > 0){
-                                        seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
-                                        need_resume = (seen + 1 == num_ops);
-                                        break;
-                                    }
-                                }
-                                else{
-                                    awaiter.result.idx = worker_id;
-                                    using result_t = decltype(result);
-                                    new (&awaiter.result.bytes) result_t(std::move(result));
-                                    need_cancel = true;
-                                    need_resume = (1-seen) == num_ops;
-                                    break;
-                                }
+                            if(seen > 0){
+                                new_val = seen + 1;
+                            }
+                            else{
+                                need_cancel = true;
+                                new_val = 1 - seen;
                             }
                         }
                         else{
-                            while(true){
-                                if(!awaiter.done.compare_exchange_weak(seen, seen - 1, std::memory_order_acq_rel)){
-                                    if(seen > 0){
-                                        seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
-                                        need_resume = (seen + 1 == num_ops);
-                                        break;
-                                    }
-                                }
-                                else{
-                                    need_resume = (1-seen) == num_ops;
-                                    break;
-                                }
-                            }
+                            new_val = (seen > 0 ? seen + 1 : seen - 1);
+                        }
+                        if(awaiter.done.compare_exchange_weak(seen, new_val, std::memory_order_acq_rel)){
+                            int completed = (new_val >= 0 ? new_val : -new_val);
+                            need_resume = completed == num_ops;
+                            break;
                         }
                     }
+
                     if(need_cancel){
+                        awaiter.result.idx = worker_id;
+                        using result_t = decltype(result);
+                        new (&awaiter.result.bytes) result_t(std::move(result));
                         awaiter.cancel_except<worker_id, 0>(); 
                     }
                     if(need_resume){
