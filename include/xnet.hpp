@@ -270,24 +270,26 @@ namespace xnet{
     };
 
     struct CancelHandle{
-        io_context* ctx;
-        std::coroutine_handle<> target;
+        template<class T>
+        static details::io_result<bool> call_traits(void* p) noexcept{
+            return (*static_cast<T*>(p)).cancel();
+        }
+
+        typedef details::io_result<bool>(*Call)(void*);
+
+        Call call_func;
+        void* p;
     public:
         CancelHandle() = default;
         ~CancelHandle() = default;
         CancelHandle(const CancelHandle&) = default;
-        CancelHandle& operator=(const CancelHandle& other) = default;
-        CancelHandle(io_context* ctx, std::coroutine_handle<> h) noexcept: ctx(ctx), target(h)
+        CancelHandle& operator=(const CancelHandle&) = default;
+        template<class T>
+        CancelHandle(T* t) noexcept: call_func(call_traits<T>), p(t)
         {}
-
-        details::io_result<bool> cancel() noexcept;
-        CancelHandle& async_cancel() noexcept { return *this; }
         
-        bool invalid() const noexcept { return this->target == nullptr; }
-
-        bool await_ready() const noexcept;
-        bool await_suspend(std::coroutine_handle<> caller) noexcept;
-        details::io_result<bool> await_resume() noexcept;
+        details::io_result<bool> cancel() noexcept { return this->call_func(this->p); }
+        bool invalid() const noexcept { return this->p == nullptr; }
     };
 
     struct CancelChain{
@@ -396,10 +398,6 @@ namespace xnet{
             return {false, EAGAIN};
         }
 
-        CancelHandle& async_cancel() noexcept{
-            return this->h.promise().chain.cancelhandle;
-        }
-
         bool await_ready() const noexcept{
             return !h || h.done();
         }
@@ -497,10 +495,6 @@ namespace xnet{
                 return {false, ECANCELED};
             }
             return {false, EAGAIN};
-        }
-
-        CancelHandle& async_cancel() noexcept {
-            return this->h.promise().chain.cancelhandle;
         }
 
         bool await_ready() const noexcept{
@@ -683,6 +677,15 @@ namespace xnet{
                 }
             }
 
+            template<class Promise>
+            void hook(std::coroutine_handle<Promise> h){
+                if constexpr(!std::is_same_v<Promise, void>){
+                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
+                        h.promise().xcoro_hook(this);
+                    }
+                }
+            }
+
             template<size_t i = 0>
             void start_all_tasks() noexcept{
                 if constexpr(i < num_ops){
@@ -749,11 +752,19 @@ namespace xnet{
             AllAwaiter(AllAwaiter&&) = default;
             ~AllAwaiter() = default;
 
+            details::io_result<bool> cancel() noexcept{
+                this->cancel_except<num_ops + 1, 0>();
+                return {true, 0};
+            }
+            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) noexcept {
+            template<class Promise>
+            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                this->start_all_tasks();
+                this->hook(handle);
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -812,6 +823,15 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
+                }
+            }
+
+            template<class Promise>
+            void hook(std::coroutine_handle<Promise> h){
+                if constexpr(!std::is_same_v<Promise, void>){
+                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
+                        h.promise().xcoro_hook(this);
+                    }
                 }
             }
 
@@ -897,11 +917,19 @@ namespace xnet{
             AnyAwaiter(AnyAwaiter&&) = default;
             ~AnyAwaiter() = default;
 
+            details::io_result<bool> cancel() noexcept{
+                this->cancel_except<num_ops + 1, 0>();
+                return {true, 0};
+            }
+            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) noexcept {
+            template<class Promise>
+            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                this->start_all_tasks();
+                this->hook(handle);
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -920,6 +948,15 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
+                }
+            }
+
+            template<class Promise>
+            void hook(std::coroutine_handle<Promise> h){
+                if constexpr(!std::is_same_v<Promise, void>){
+                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
+                        h.promise().xcoro_hook(this);
+                    }
                 }
             }
 
@@ -998,11 +1035,19 @@ namespace xnet{
             AllAwaiter(AllAwaiter&&) = default;
             ~AllAwaiter() = default;
 
+            details::io_result<bool> cancel() noexcept{
+                this->cancel_except<num_ops + 1, 0>();
+                return {true, 0};
+            }
+            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) noexcept {
+            template<class Promise>
+            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                this->start_all_tasks();
+                this->hook(handle);
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1060,6 +1105,15 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
+                }
+            }
+
+            template<class Promise>
+            void hook(std::coroutine_handle<Promise> h){
+                if constexpr(!std::is_same_v<Promise, void>){
+                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
+                        h.promise().xcoro_hook(this);
+                    }
                 }
             }
 
@@ -1154,11 +1208,19 @@ namespace xnet{
             AnyAwaiter(AnyAwaiter&&) = default;
             ~AnyAwaiter() = default;
 
+            details::io_result<bool> cancel() noexcept{
+                this->cancel_except<num_ops + 1, 0>();
+                return {true, 0};
+            }
+            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> handle) noexcept {
+            template<class Promise>
+            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                this->start_all_tasks();
+                this->hook(handle);
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1591,7 +1653,7 @@ namespace xnet{
                     AsyncStream& sender() noexcept{ return this->stream; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept{ return this->handler; }
-                    CancelHandle cancelhandle() noexcept{ return CancelHandle{this->stream.ctx, this->handler}; }
+                    CancelHandle cancelhandle() noexcept{ return CancelHandle{this}; }
 
 
                     details::io_result<bool> cancel() noexcept{
@@ -1608,7 +1670,6 @@ namespace xnet{
                             *this->stream.ctx, this->handler
                         );
                     }
-                    CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                     bool await_ready() noexcept{ return false; }
 
@@ -1678,7 +1739,7 @@ namespace xnet{
                 AsyncStream& sender() noexcept{ return this->stream; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this->stream.ctx, this->handler}; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) & noexcept{ 
                     return IOTimeoutAwaiter(this->stream, s, ns, this->args); 
@@ -1702,7 +1763,6 @@ namespace xnet{
                         *this->stream.ctx, this->handler
                     );
                 }
-                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept{ return false; }
 
@@ -1995,7 +2055,7 @@ namespace xnet{
                     AsyncAccepter& sender() noexcept { return this->accepter; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                    CancelHandle cancelhandle() noexcept { return CancelHandle{this->accepter.ctx, this->handler}; }
+                    CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                     details::io_result<bool> cancel() noexcept{
                         using func_type = decltype(io_uring_prep_cancel);
@@ -2004,7 +2064,6 @@ namespace xnet{
                             *this->accepter.ctx, this->handler
                         );
                     }
-                    CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                     bool await_ready() const noexcept{ return false; }
 
@@ -2076,7 +2135,7 @@ namespace xnet{
                 AsyncAccepter& sender() noexcept { return this->accepter; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this->accepter.ctx, this->handler}; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) const noexcept{ 
                     return AcceptTimeoutAwaiter(this->accepter, s, ns); 
@@ -2089,7 +2148,6 @@ namespace xnet{
                         *this->accepter.ctx, this->handler
                     );
                 }
-                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() const noexcept{ return false; }
 
@@ -2214,7 +2272,7 @@ namespace xnet{
                 AsyncTimer& sender() noexcept { return this->timer; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this->timer.ctx, this->handler}; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_timeout_remove);
@@ -2223,7 +2281,6 @@ namespace xnet{
                         *this->timer.ctx, this->handler
                     );
                 }
-                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept{ 
                     if(this->ts.tv_sec != 0 || this->ts.tv_nsec != 0){
@@ -2342,7 +2399,7 @@ namespace xnet{
                 AsyncFileSystem& sender(){ return this->filesystem; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this->filesystem.ctx, this->handler}; }
+                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
                     using func_type = decltype(io_uring_prep_cancel);
@@ -2351,7 +2408,6 @@ namespace xnet{
                         *this->filesystem.ctx, this->handler
                     );
                 }
-                CancelHandle async_cancel() noexcept{ return this->cancelhandle(); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -2445,39 +2501,6 @@ namespace xnet{
             }
         };
     };
-
-    inline details::io_result<bool> CancelHandle::cancel() noexcept {
-        using func_type = decltype(io_uring_prep_cancel);
-        using data_type = void*;
-        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
-            *this->ctx, this->target
-        );
-    }
-
-    inline bool CancelHandle::await_ready() const noexcept{
-        bool suspended = this->target != nullptr;
-        if(!suspended){
-            io_context::result() = -EAGAIN;
-        }
-        return !suspended;
-    }
-
-    inline bool CancelHandle::await_suspend(std::coroutine_handle<> caller) noexcept{
-        using func_type = decltype(io_uring_prep_cancel);
-        using data_type = void*;
-        auto submitted = io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
-            *this->ctx, this->target, caller
-        );
-        if(!submitted){
-            io_context::result() = -submitted.err;
-        }
-        return *submitted;
-    }
-
-    inline details::io_result<bool> CancelHandle::await_resume() noexcept{
-        int res = io_context::result();
-        return { res >= 0, res < 0 ? -res : 0 };
-    }
 
     template<int xdomain, int xtype>
     using AsyncAccepter = io_context::AsyncAccepter<xdomain, xtype>;
