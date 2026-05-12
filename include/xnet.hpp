@@ -201,14 +201,14 @@ namespace xnet{
         public:
             int err = -1;
             io_result() noexcept: value(), err(-1){}
-            io_result(const io_result&) = delete;
+            io_result(const io_result& other) noexcept: value(other.value), err(other.err){}
             io_result(io_result&& other) noexcept: value(std::move(other.value)), err(other.err){}
             void operator=(io_result&& other) noexcept{
                 value = std::move(other.value);
                 err = other.err;
             }
-            template<class V>
-            io_result(V&& v, int err) noexcept: value(std::forward<V>(v)), err(err){}
+            template<class V, class E>
+            io_result(V&& v, E&& err) noexcept: value(std::forward<V>(v)), err(std::forward<E>(err)){}
             ~io_result(){}
 
             T& operator*() noexcept{
@@ -250,7 +250,7 @@ namespace xnet{
             int err;
 
             io_result() noexcept: err(SOCKET_ERROR){}
-            io_result(const io_result&) = delete;
+            io_result(const io_result&) = default;
             io_result(io_result&& other) noexcept: err(other.err){}
             void operator=(io_result&& other) noexcept{
                 err = other.err;
@@ -290,6 +290,7 @@ namespace xnet{
         
         details::io_result<bool> cancel() noexcept { return this->call_func(this->p); }
         bool invalid() const noexcept { return this->p == nullptr; }
+        void reset() noexcept { this->p = nullptr; }
     };
 
     struct CancelChain{
@@ -327,6 +328,43 @@ namespace xnet{
                 }
             }
 
+            void xcoro_unhook() noexcept{
+                CancelChain* block = &this->chain;
+                while(block){
+                    block->cancelhandle.reset();
+                    block = block->father;
+                }
+            }
+
+            template<class Awaiter>
+            struct Wrapper {
+                Awaiter a;
+
+                bool await_ready() noexcept(noexcept(a.await_ready())){
+                    return a.await_ready();
+                }
+
+                auto await_suspend(std::coroutine_handle<promise_type> h) noexcept(noexcept(a.await_suspend(h))){
+                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                        h.promise().xcoro_hook(&this->a);
+                    }
+                    return a.await_suspend(h);
+                }
+
+                auto await_resume() noexcept(noexcept(a.await_resume())){
+                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                        auto h = std::coroutine_handle<promise_type>::from_address(a.handle().address());
+                        h.promise().xcoro_unhook();
+                    }
+                    return a.await_resume();
+                }
+            };
+
+            template<class Awaiter>
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                return Wrapper<Awaiter>{std::forward<Awaiter>(awaiter)};
+            }
+
             task<T> get_return_object() noexcept {
                 return task<T>{
                     std::coroutine_handle<promise_type>::from_promise(*this)
@@ -354,7 +392,7 @@ namespace xnet{
 
             template<class V>
             void return_value(V&& v) noexcept{
-                value = std::forward<V>(v);
+                this->value = T(std::forward<V>(v));
             }
 
             void return_value(T&& v) noexcept {
@@ -431,6 +469,43 @@ namespace xnet{
                     block->cancelhandle = handle;
                     block = block->father;
                 }
+            }
+
+            void xcoro_unhook() noexcept{
+                CancelChain* block = &this->chain;
+                while(block){
+                    block->cancelhandle.reset();
+                    block = block->father;
+                }
+            }
+
+            template<class Awaiter>
+            struct Wrapper {
+                Awaiter a;
+
+                bool await_ready() noexcept(noexcept(a.await_ready())){
+                    return a.await_ready();
+                }
+
+                auto await_suspend(std::coroutine_handle<promise_type> h) noexcept(noexcept(a.await_suspend(h))){
+                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                        h.promise().xcoro_hook(&this->a);
+                    }
+                    return a.await_suspend(h);
+                }
+
+                auto await_resume() noexcept(noexcept(a.await_resume())){
+                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                        auto h = std::coroutine_handle<promise_type>::from_address(a.handle().address());
+                        h.promise().xcoro_unhook();
+                    }
+                    return a.await_resume();
+                }
+            };
+
+            template<class Awaiter>
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                return Wrapper<Awaiter>{std::forward<Awaiter>(awaiter)};
             }
 
             task<void> get_return_object() noexcept {
@@ -677,15 +752,6 @@ namespace xnet{
                 }
             }
 
-            template<class Promise>
-            void hook(std::coroutine_handle<Promise> h){
-                if constexpr(!std::is_same_v<Promise, void>){
-                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                        h.promise().xcoro_hook(this);
-                    }
-                }
-            }
-
             template<size_t i = 0>
             void start_all_tasks() noexcept{
                 if constexpr(i < num_ops){
@@ -757,14 +823,14 @@ namespace xnet{
                 return {true, 0};
             }
             CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+            std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
             void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                this->start_all_tasks();
-                this->hook(handle);
+                return this->start_all_tasks();
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -823,15 +889,6 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
-                }
-            }
-
-            template<class Promise>
-            void hook(std::coroutine_handle<Promise> h){
-                if constexpr(!std::is_same_v<Promise, void>){
-                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                        h.promise().xcoro_hook(this);
-                    }
                 }
             }
 
@@ -922,14 +979,14 @@ namespace xnet{
                 return {true, 0};
             }
             CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+            std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
             void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                this->start_all_tasks();
-                this->hook(handle);
+                return this->start_all_tasks();
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -948,15 +1005,6 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
-                }
-            }
-
-            template<class Promise>
-            void hook(std::coroutine_handle<Promise> h){
-                if constexpr(!std::is_same_v<Promise, void>){
-                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                        h.promise().xcoro_hook(this);
-                    }
                 }
             }
 
@@ -1032,7 +1080,10 @@ namespace xnet{
 
             AllAwaiter(Ops&&... ops) noexcept: ops(std::forward<Ops>(ops)...), result({}), handler(nullptr), done(0)
             {}
-            AllAwaiter(AllAwaiter&&) = default;
+            AllAwaiter(AllAwaiter&& other) 
+            noexcept: ops(std::move(other.ops)), result(std::move(other.result)), 
+            handler(std::exchange(other.handler, nullptr)), done(other.done.load(std::memory_order_relaxed))
+            {}
             ~AllAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
@@ -1040,14 +1091,14 @@ namespace xnet{
                 return {true, 0};
             }
             CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+            std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
             void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                this->start_all_tasks();
-                this->hook(handle);
+                return this->start_all_tasks();
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1105,15 +1156,6 @@ namespace xnet{
                         (void)std::get<i>(ops).cancel();
                     }
                     return cancel_except<hit, i+1>();
-                }
-            }
-
-            template<class Promise>
-            void hook(std::coroutine_handle<Promise> h){
-                if constexpr(!std::is_same_v<Promise, void>){
-                    if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                        h.promise().xcoro_hook(this);
-                    }
                 }
             }
 
@@ -1205,7 +1247,10 @@ namespace xnet{
 
             AnyAwaiter(Ops&&... ops) noexcept: ops(std::forward<Ops>(ops)...), result({}), handler(nullptr), done(0)
             {}
-            AnyAwaiter(AnyAwaiter&&) = default;
+            AnyAwaiter(AnyAwaiter&& other) 
+            noexcept: ops(std::move(other.ops)), result(std::move(other.result)), 
+            handler(std::exchange(other.handler, nullptr)), done(other.done.load(std::memory_order_relaxed))
+            {}
             ~AnyAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
@@ -1213,14 +1258,14 @@ namespace xnet{
                 return {true, 0};
             }
             CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
+            std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
             void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                this->start_all_tasks();
-                this->hook(handle);
+                return this->start_all_tasks();
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1611,15 +1656,6 @@ namespace xnet{
                     return prep_func(sqe, this->stream.stream, std::get<I>(args)...); 
                 }
 
-                template<class Promise>
-                void hook(std::coroutine_handle<Promise> h){
-                    if constexpr(!std::is_same_v<Promise, void>){
-                        if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                            h.promise().xcoro_hook(this);
-                        }
-                    }
-                }
-
                 class [[nodiscard]] IOTimeoutAwaiter{
                     AsyncStream& stream;
                     std::coroutine_handle<> handler;
@@ -1631,14 +1667,6 @@ namespace xnet{
                         return prep_func(sqe, this->stream.stream, std::get<I>(args)...); 
                     }
                 
-                    template<class Promise>
-                    void hook(std::coroutine_handle<Promise> h){
-                        if constexpr(!std::is_same_v<Promise, void>){
-                            if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                                h.promise().xcoro_hook(this);
-                            }
-                        }
-                    }
                 public:
                     template<class T>
                     IOTimeoutAwaiter(AsyncStream& stream, uint32_t s, uint32_t ns, T&& args) 
@@ -1703,7 +1731,6 @@ namespace xnet{
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->stream.ctx->unlock();
                         }
-                        this->hook(h);
                         return suspended;
                     }
 
@@ -1790,7 +1817,6 @@ namespace xnet{
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->stream.ctx->unlock();
                     }
-                    this->hook(h);
                     return suspended;
                 }
 
@@ -2021,28 +2047,10 @@ namespace xnet{
                 AsyncAccepter& accepter;
                 std::coroutine_handle<> handler;
 
-                template<class Promise>
-                void hook(std::coroutine_handle<Promise> h){
-                    if constexpr(!std::is_same_v<Promise, void>){
-                        if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                            h.promise().xcoro_hook(this);
-                        }
-                    }
-                }
-
                 class [[nodiscard]] AcceptTimeoutAwaiter{
                     AsyncAccepter& accepter;
                     std::coroutine_handle<> handler;
                     __kernel_timespec ts;
-
-                    template<class Promise>
-                    void hook(std::coroutine_handle<Promise> h){
-                        if constexpr(!std::is_same_v<Promise, void>){
-                            if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                                h.promise().xcoro_hook(this);
-                            }
-                        }
-                    }
                 public:
                     AcceptTimeoutAwaiter(AsyncAccepter& accepter, uint32_t s, uint32_t ns) 
                     noexcept: accepter(accepter), handler(nullptr), ts({s, ns})
@@ -2097,7 +2105,6 @@ namespace xnet{
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->accepter.ctx->unlock();
                         }
-                        this->hook(h);
                         return suspended;
                     }
 
@@ -2174,7 +2181,6 @@ namespace xnet{
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->accepter.ctx->unlock();
                     }
-                    this->hook(h);
                     return suspended;
                 }
 
@@ -2252,15 +2258,6 @@ namespace xnet{
                 AsyncTimer& timer;
                 std::coroutine_handle<> handler;
                 __kernel_timespec ts;
-
-                template<class Promise>
-                void hook(std::coroutine_handle<Promise> h){
-                    if constexpr(!std::is_same_v<Promise, void>){
-                        if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                            h.promise().xcoro_hook(this);
-                        }
-                    }
-                }
             public:
                 Awaiter(AsyncTimer& timer, uint32_t s, uint32_t ns) noexcept: timer(timer), handler(), ts({s, ns})
                 {}
@@ -2313,7 +2310,6 @@ namespace xnet{
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->timer.ctx->unlock();
                     }
-                    this->hook(h);
                     return suspended;
                 }
 
@@ -2368,15 +2364,6 @@ namespace xnet{
                 template<size_t... I>
                 void prep(io_uring_sqe* sqe, std::index_sequence<I...>) noexcept{
                     return prep_func(sqe, std::get<I>(args)...); 
-                }
-
-                template<class Promise>
-                void hook(std::coroutine_handle<Promise> h){
-                    if constexpr(!std::is_same_v<Promise, void>){
-                        if constexpr (requires { h.promise().xcoro_hook(this); }) {
-                            h.promise().xcoro_hook(this);
-                        }
-                    }
                 }
 
                 AsyncFileSystem& filesystem;
@@ -2434,7 +2421,6 @@ namespace xnet{
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->filesystem.ctx->unlock();
                     }
-                    this->hook(h);
                     return suspended;
                 }
 

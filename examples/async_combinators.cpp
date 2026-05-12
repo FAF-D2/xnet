@@ -69,7 +69,7 @@ xnet::task<> demo_all(xnet::io_context& ctx){
     auto coro2 = coro<true>(ctx, 7);
     auto coro3 = coro<>(ctx, 9);
     auto coro4 = coro<>(ctx, 11);
-    auto& [r1, r2, r3, r4] = co_await xnet::all(coro1, coro2, coro3, coro4);
+    auto&& [r1, r2, r3, r4] = co_await xnet::all(coro1, coro2, coro3, coro4);
     printf("[demo_all] results: r1-%d, r2-%d, r3-%d, r4-%d\n", *r1, *r2, *r3, *r4); // 500, 0, 0, 0
 }
 
@@ -80,7 +80,7 @@ xnet::task<> demo_allSettled(xnet::io_context& ctx){
     auto coro2 = coro<true>(ctx, 7);
     auto coro3 = coro<>(ctx, 9);
     auto coro4 = coro<>(ctx, 11);
-    auto& [r1, r2, r3, r4] = co_await xnet::allSettled(coro1, coro2, coro3, coro4);
+    auto&& [r1, r2, r3, r4] = co_await xnet::allSettled(coro1, coro2, coro3, coro4);
     printf("[demo_allSettled] results: r1-%d, r2-%d, r3-%d, r4-%d\n", *r1, *r2, *r3, *r4); // 500, 700, 900, 1100
 }
 
