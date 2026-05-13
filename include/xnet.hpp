@@ -80,6 +80,10 @@ namespace xnet{
         static void prep_sendfile(io_uring_sqe* sqe, int sockfd, int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept{
             ::io_uring_prep_splice(sqe, filefd, offset, sockfd, -1, bytes, flags);
         }
+        static void prep_poll_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
+            (void)flags;
+            return ::io_uring_prep_poll_remove(sqe, user_data);
+        }
 
         template<class F, F io_func>
         struct args_traits{};
@@ -267,6 +271,65 @@ namespace xnet{
             bool timed() const noexcept { return this->err == ETIME; }
             bool rst() const noexcept { return this->err == ECONNRESET; }
         };
+
+        template<class Awaiter, class Promise, class suspend_ret_t>
+        struct Wrapper {
+            Awaiter a;
+
+            bool await_ready() noexcept(noexcept(a.await_ready())){
+                return a.await_ready();
+            }
+            
+            auto await_suspend(std::coroutine_handle<Promise> h) noexcept(noexcept(a.await_suspend(h))){
+                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                    auto result = a.await_suspend(h);
+                    if constexpr(std::is_same<suspend_ret_t, bool>::value){
+                        if(result){
+                            h.promise().xcoro_hook(&this->a);
+                        }
+                    }
+                    else{
+                        h.promise().xcoro_hook(&this->a);
+                    }
+                    return result;
+                }
+                return a.await_suspend(h);
+            }
+
+            auto await_resume() noexcept(noexcept(a.await_resume())){
+                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                    auto h = std::coroutine_handle<Promise>::from_address(a.handle().address());
+                    h.promise().xcoro_unhook();
+                }
+                return a.await_resume();
+            }
+        };
+
+        template<class Awaiter, class Promise>
+        struct Wrapper<Awaiter, Promise, void>{
+            Awaiter a;
+
+            bool await_ready() noexcept(noexcept(a.await_ready())){
+                return a.await_ready();
+            }
+            
+            auto await_suspend(std::coroutine_handle<Promise> h) noexcept(noexcept(a.await_suspend(h))){
+                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                    a.await_suspend(h);
+                    h.promise().xcoro_hook(&this->a);
+                    return;
+                }
+                return a.await_suspend(h);
+            }
+
+            auto await_resume() noexcept(noexcept(a.await_resume())){
+                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
+                    auto h = std::coroutine_handle<Promise>::from_address(a.handle().address());
+                    h.promise().xcoro_unhook();
+                }
+                return a.await_resume();
+            }
+        };
     };
 
     struct CancelHandle{
@@ -337,32 +400,10 @@ namespace xnet{
             }
 
             template<class Awaiter>
-            struct Wrapper {
-                Awaiter a;
-
-                bool await_ready() noexcept(noexcept(a.await_ready())){
-                    return a.await_ready();
-                }
-
-                auto await_suspend(std::coroutine_handle<promise_type> h) noexcept(noexcept(a.await_suspend(h))){
-                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                        h.promise().xcoro_hook(&this->a);
-                    }
-                    return a.await_suspend(h);
-                }
-
-                auto await_resume() noexcept(noexcept(a.await_resume())){
-                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                        auto h = std::coroutine_handle<promise_type>::from_address(a.handle().address());
-                        h.promise().xcoro_unhook();
-                    }
-                    return a.await_resume();
-                }
-            };
-
-            template<class Awaiter>
             auto await_transform(Awaiter&& awaiter) noexcept{
-                return Wrapper<Awaiter>{std::forward<Awaiter>(awaiter)};
+                using coro_handle_t = std::coroutine_handle<promise_type>;
+                using suspend_ret_t = decltype(awaiter.await_suspend(std::declval<coro_handle_t>()));
+                return details::Wrapper<Awaiter, promise_type, suspend_ret_t>{std::forward<Awaiter>(awaiter)};
             }
 
             task<T> get_return_object() noexcept {
@@ -480,32 +521,10 @@ namespace xnet{
             }
 
             template<class Awaiter>
-            struct Wrapper {
-                Awaiter a;
-
-                bool await_ready() noexcept(noexcept(a.await_ready())){
-                    return a.await_ready();
-                }
-
-                auto await_suspend(std::coroutine_handle<promise_type> h) noexcept(noexcept(a.await_suspend(h))){
-                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                        h.promise().xcoro_hook(&this->a);
-                    }
-                    return a.await_suspend(h);
-                }
-
-                auto await_resume() noexcept(noexcept(a.await_resume())){
-                    if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                        auto h = std::coroutine_handle<promise_type>::from_address(a.handle().address());
-                        h.promise().xcoro_unhook();
-                    }
-                    return a.await_resume();
-                }
-            };
-
-            template<class Awaiter>
             auto await_transform(Awaiter&& awaiter) noexcept{
-                return Wrapper<Awaiter>{std::forward<Awaiter>(awaiter)};
+                using coro_handle_t = std::coroutine_handle<promise_type>;
+                using suspend_ret_t = decltype(awaiter.await_suspend(std::declval<coro_handle_t>()));
+                return details::Wrapper<Awaiter, promise_type, suspend_ret_t>{std::forward<Awaiter>(awaiter)};
             }
 
             task<void> get_return_object() noexcept {
@@ -819,6 +838,9 @@ namespace xnet{
             ~AllAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
+                if(this->handler == nullptr){
+                    return {false, ECANCELED};
+                }
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
@@ -834,6 +856,7 @@ namespace xnet{
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
+                this->handler = nullptr;
                 return this->result;
             }
         };
@@ -975,6 +998,9 @@ namespace xnet{
             ~AnyAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
+                if(this->handler == nullptr){
+                    return {false, ECANCELED};
+                }
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
@@ -990,6 +1016,7 @@ namespace xnet{
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
+                this->handler = nullptr;
                 return this->result;
             }
         };
@@ -1087,6 +1114,9 @@ namespace xnet{
             ~AllAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
+                if(this->handler == nullptr){
+                    return {false, ECANCELED};
+                }
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
@@ -1102,6 +1132,7 @@ namespace xnet{
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
+                this->handler = nullptr;
                 return this->result;
             }
         };
@@ -1254,6 +1285,9 @@ namespace xnet{
             ~AnyAwaiter() = default;
 
             details::io_result<bool> cancel() noexcept{
+                if(this->handler == nullptr){
+                    return {false, ECANCELED};
+                }
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
@@ -1269,6 +1303,7 @@ namespace xnet{
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
+                this->handler = nullptr;
                 return this->result;
             }
         };
@@ -1423,7 +1458,7 @@ namespace xnet{
                 }
                 return details::io_result<bool>(submitted, submitted ? 0 : EAGAIN);
             }
-            return details::io_result<bool>(false, EAGAIN);
+            return details::io_result<bool>(false, ECANCELED);
         }
 
         bool invalid() const noexcept { return ring.ring_fd == -1; }
@@ -1686,9 +1721,9 @@ namespace xnet{
 
                     details::io_result<bool> cancel() noexcept{
                         if constexpr(details::is_poll_add<prep_func>::value){
-                            using func_type = decltype(io_uring_prep_poll_remove);
+                            using func_type = decltype(details::prep_poll_remove);
                             using data_type = unsigned long long;
-                            return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
+                            return io_context::cancel<func_type, details::prep_poll_remove, data_type>(
                                 *this->stream.ctx, this->handler
                             );
                         }
@@ -1735,6 +1770,7 @@ namespace xnet{
                     }
 
                     details::io_result<size_t> await_resume() noexcept{
+                        this->handler = nullptr;
                         int result = io_context::result();
                         int err = result < 0 ? -result : 0;
                         size_t r = result < 0 ? 0 : static_cast<size_t>(result);
@@ -1777,9 +1813,9 @@ namespace xnet{
 
                 details::io_result<bool> cancel() noexcept{
                     if constexpr(details::is_poll_add<prep_func>::value){
-                        using func_type = decltype(io_uring_prep_poll_remove);
+                        using func_type = decltype(details::prep_poll_remove);
                         using data_type = unsigned long long;
-                        return io_context::cancel<func_type, io_uring_prep_poll_remove, data_type>(
+                        return io_context::cancel<func_type, details::prep_poll_remove, data_type>(
                             *this->stream.ctx, this->handler
                         );
                     }
@@ -1821,6 +1857,7 @@ namespace xnet{
                 }
 
                 details::io_result<size_t> await_resume() noexcept{
+                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = result < 0 ? -result : 0;
                     size_t r = result < 0 ? 0 : static_cast<size_t>(result);
@@ -2109,6 +2146,7 @@ namespace xnet{
                     }
 
                     details::io_result<tcp_type> await_resume() noexcept{
+                        this->handler = nullptr;
                         int result = io_context::result();
                         int err = 0;
                         if(result < 0){
@@ -2185,6 +2223,7 @@ namespace xnet{
                 }
 
                 details::io_result<tcp_type> await_resume() noexcept{
+                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = 0;
                     if(result < 0){
@@ -2314,6 +2353,7 @@ namespace xnet{
                 }
 
                 details::io_result<void> await_resume() noexcept{
+                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = result != -ETIME ? -result : 0;
                     if(this->handler){
@@ -2425,6 +2465,7 @@ namespace xnet{
                 }
 
                 details::io_result<Ret> await_resume() noexcept{
+                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = 0;
                     if(result < 0){
