@@ -1667,7 +1667,9 @@ namespace xnet{
             {}
             void operator=(AsyncStream&& other) = delete;
             ~AsyncStream(){
-                this->close();
+                if(stream != INVALID_HANDLE){
+                    ::close(this->stream);
+                }
             }
         private:
             template<class P, P prep_func>
@@ -1872,28 +1874,9 @@ namespace xnet{
             void shutdown(int how = SHUT_RDWR) noexcept{
                 ::shutdown(this->stream, how);
             }
-
             void close() noexcept{
                 if(stream != INVALID_HANDLE){
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->ctx->lock();
-                    }
-
-                    io_uring_sqe* sqe = io_uring_get_sqe(&this->ctx->ring);
-                    if(sqe != nullptr){
-                        io_uring_prep_close(sqe, this->stream);
-                        XNET_SET_FLAGS_SKIP_SUCCESS(sqe);
-                        io_uring_sqe_set_data(sqe, nullptr);
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->ctx->unlock();
-                        }
-                    }
-                    else{
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->ctx->unlock();
-                        }
-                        ::close(this->stream);
-                    }
+                    ::close(this->stream);
                     stream = INVALID_HANDLE;
                 }
             }
@@ -2077,7 +2060,9 @@ namespace xnet{
             {}
             void operator=(AsyncAccepter&& other) = delete;
             ~AsyncAccepter(){
-                this->close();
+                if(server != INVALID_HANDLE){
+                    ::close(this->server);
+                }
             }
         private:
             class [[nodiscard]] AcceptAwaiter{
@@ -2251,25 +2236,7 @@ namespace xnet{
             }
             void close() noexcept{
                 if(server != INVALID_HANDLE){
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->ctx->lock();
-                    }
-
-                    io_uring_sqe* sqe = io_uring_get_sqe(&this->ctx->ring);
-                    if(sqe != nullptr){
-                        io_uring_prep_close(sqe, this->server);
-                        XNET_SET_FLAGS_SKIP_SUCCESS(sqe);
-                        io_uring_sqe_set_data(sqe, nullptr);
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->ctx->unlock();
-                        }
-                    }
-                    else{
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->ctx->unlock();
-                        }
-                        ::close(this->server);
-                    }
+                    ::close(this->server);
                     server = INVALID_HANDLE;
                 }
             }
