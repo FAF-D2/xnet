@@ -64,8 +64,7 @@ void my_scheduler(xnet::io_context& ctx){
 int main(){
     xnet::io_context ctx(SQE_BATCH);
 
-    auto main_coro = accept_loop(ctx);
-    main_coro.start();
+    xnet::fire(accept_loop(ctx));
     my_scheduler(ctx);
 
     return 0;

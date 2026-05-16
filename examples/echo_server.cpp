@@ -12,8 +12,8 @@ void my_scheduler(xnet::io_context& ctx);
 int main() {
     xnet::io_context ctx(256);
 
-    auto main_coro = accept_loop(ctx);
-    main_coro.start();   // run until first suspend
+    xnet::fire(accept_loop(ctx)); // fire the accept_loop
+
     monitor(ctx, 10);    // fire the monitor coroutine
     my_scheduler(ctx);
 
@@ -63,6 +63,7 @@ xnet::task<> accept_loop(xnet::io_context& ctx) {
             printf("accept error: %d\n", result.err);
             continue;
         }
+        printf("accepted, spawn echo\n");
         echo(result.move()); // spawn echo coroutine
     }
 }

@@ -67,9 +67,7 @@ void worker_thread(size_t id){
     (void)id;
     xnet::io_context ctx(SQE_BATCH);
 
-    auto main_coro = accept_loop(ctx);
-    main_coro.start();
-
+    xnet::fire(accept_loop(ctx));
     my_scheduler(ctx);
 }
 

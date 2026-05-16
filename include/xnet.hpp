@@ -10,7 +10,7 @@
 
 // #define XNET_DISABLE_THREAD_SAFE
 #ifdef XNET_DISABLE_THREAD_SAFE
-#warning "xnet compiled in thread-unsafe mode: concurrent operations on io_context/stream/awaiters are not safe"
+#pragma message "xnet compiled in thread-unsafe mode: concurrent operations on io_context/stream/awaiters are not safe"
 #endif
 
 #ifdef __linux__
@@ -281,18 +281,6 @@ namespace xnet{
             }
             
             auto await_suspend(std::coroutine_handle<Promise> h) noexcept(noexcept(a.await_suspend(h))){
-                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                    auto result = a.await_suspend(h);
-                    if constexpr(std::is_same<suspend_ret_t, bool>::value){
-                        if(result){
-                            h.promise().xcoro_hook(&this->a);
-                        }
-                    }
-                    else{
-                        h.promise().xcoro_hook(&this->a);
-                    }
-                    return result;
-                }
                 return a.await_suspend(h);
             }
 
@@ -314,11 +302,6 @@ namespace xnet{
             }
             
             auto await_suspend(std::coroutine_handle<Promise> h) noexcept(noexcept(a.await_suspend(h))){
-                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                    a.await_suspend(h);
-                    h.promise().xcoro_hook(&this->a);
-                    return;
-                }
                 return a.await_suspend(h);
             }
 
@@ -355,11 +338,92 @@ namespace xnet{
         bool invalid() const noexcept { return this->p == nullptr; }
         void reset() noexcept { this->p = nullptr; }
     };
-
-    struct CancelChain{
+#ifndef XNET_DISABLE_THREAD_SAFE
+    // state:
+    // 00 --- not suspended && not cancelled request
+    // 01 --- not suspended && cancelled request
+    // 10 --- suspended && not cancelled request
+    // 11 --- suspended && cancelled request
+    class CancelChain{
         CancelHandle cancelhandle;
-        CancelChain* father = nullptr;
+        std::atomic<int> use_count = 1;
+        std::atomic<int> state = 0b00;
+    public:
+        CancelChain(int ref) noexcept: cancelhandle(), use_count(ref), state(0b00)
+        {}
+
+        details::io_result<bool> request_cancel() noexcept{
+            int expected = this->state.load(std::memory_order_acquire);
+            while(true){
+                if(expected & 0b01){
+                    return {true, 0};
+                }
+
+                int desired = expected | 0b01;
+                if(state.compare_exchange_weak(expected, desired, std::memory_order_acq_rel)){
+                    if(expected == 0b10){
+                        return this->cancelhandle.cancel();
+                    }
+                    return {true, 0};
+                }
+            }
+        }
+
+        bool hook(const CancelHandle& handle) noexcept{
+            this->cancelhandle = handle;
+            int expected = 0b00;
+            if(!state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
+                return false;
+            }
+            return true;
+        }
+
+        void unhook() noexcept{
+            this->state.fetch_and(0b01, std::memory_order_release);
+        }
+
+        int add_ref() noexcept{ 
+            return this->use_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        }
+        int dec_ref() noexcept{ 
+            return this->use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        }
     };
+#else
+    class CancelChain{
+        CancelHandle cancelhandle;
+        int use_count = 1;
+        int state = 0b00;
+    public:
+        CancelChain(int ref) noexcept: cancelhandle(), use_count(ref), state(0b00)
+        {}
+
+        details::io_result<bool> request_cancel() noexcept{
+            int expected = this->state;
+            this->state = expected | 0b01;
+            if(expected == 0b10){
+                return this->cancelhandle.cancel();
+            }
+            return {true, 0};
+        }
+
+        bool hook(const CancelHandle& handle) noexcept{
+            if(this->state & 0b01){
+                return false;
+            }
+            this->cancelhandle = handle;
+            this->state = 0b10;
+            return true;
+        }
+
+        void unhook() noexcept{
+            this->state &= 0b01;
+        }
+
+        int add_ref() noexcept{ return ++this->use_count; }
+        int dec_ref() noexcept{ return --this->use_count; }
+    };
+#endif
 
     struct detached_task {
         struct promise_type {
@@ -377,26 +441,26 @@ namespace xnet{
     template<typename T = void>
     struct task {
         struct promise_type {
-            CancelChain chain;
+            CancelChain* chain = nullptr;
             std::coroutine_handle<> waiter = nullptr;
             T value{};
 
-            template<class IO>
-            void xcoro_hook(IO* io) noexcept{
-                auto handle = io->cancelhandle();
-                CancelChain* block = &this->chain;
-                while(block){
-                    block->cancelhandle = handle;
-                    block = block->father;
+            ~promise_type(){
+                if(this->chain && this->chain->dec_ref() == 0){
+                    delete this->chain;
                 }
             }
 
-            void xcoro_unhook() noexcept{
-                CancelChain* block = &this->chain;
-                while(block){
-                    block->cancelhandle.reset();
-                    block = block->father;
+            template<class IO>
+            bool xcoro_hook(IO* io) noexcept{
+                if(!this->chain){
+                    this->chain = new CancelChain(1);
                 }
+                return this->chain->hook(io->cancelhandle());
+            }
+
+            void xcoro_unhook() noexcept{
+                return this->chain->unhook();
             }
 
             template<class Awaiter>
@@ -459,22 +523,13 @@ namespace xnet{
             }
         }
 
-        void start() & noexcept { 
-            h.resume();
-        }
-        void start() && noexcept = delete;
-
         bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            auto& handle = h.promise().chain.cancelhandle;
-            if(!handle.invalid()){
-                if(!h.done()){
-                    return handle.cancel();
-                }
-                return {false, ECANCELED};
+            if(!this->h.promise().chain){
+                return {false, EAGAIN};
             }
-            return {false, EAGAIN};
+            return this->h.promise().chain->request_cancel();
         }
 
         bool await_ready() const noexcept{
@@ -484,8 +539,14 @@ namespace xnet{
         template<class Promise>
         auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
             auto& promise = h.promise();
-            if constexpr(requires{ promise.chain.father = &caller.promise().chain; }){
-                promise.chain.father = &caller.promise().chain;
+            if constexpr(requires{ promise.chain = caller.promise().chain; }){
+                if(!caller.promise().chain){
+                    promise.chain = caller.promise().chain = new CancelChain(2);
+                }
+                else{
+                    promise.chain = caller.promise().chain;
+                    promise.chain->add_ref();
+                }
             }
             promise.waiter = caller;
             return h;
@@ -499,25 +560,25 @@ namespace xnet{
     template<>
     struct task<void> {
         struct promise_type{
-            CancelChain chain;
+            CancelChain* chain;
             std::coroutine_handle<> waiter = nullptr;
 
-            template<class IO>
-            void xcoro_hook(IO* io) noexcept{
-                auto handle = io->cancelhandle();
-                CancelChain* block = &this->chain;
-                while(block){
-                    block->cancelhandle = handle;
-                    block = block->father;
+            ~promise_type(){
+                if(this->chain && this->chain->dec_ref() == 0){
+                    delete this->chain;
                 }
             }
 
-            void xcoro_unhook() noexcept{
-                CancelChain* block = &this->chain;
-                while(block){
-                    block->cancelhandle.reset();
-                    block = block->father;
+            template<class IO>
+            bool xcoro_hook(IO* io) noexcept{
+                if(!this->chain){
+                    this->chain = new CancelChain(1);
                 }
+                return this->chain->hook(io->cancelhandle());
+            }
+
+            void xcoro_unhook() noexcept{
+                return this->chain->unhook();
             }
 
             template<class Awaiter>
@@ -573,22 +634,13 @@ namespace xnet{
             }
         }
 
-        void start() & noexcept { 
-            h.resume();
-        }
-        void start() && noexcept = delete;
-
         bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            auto& handle = h.promise().chain.cancelhandle;
-            if(!handle.invalid()){
-                if(!h.done()){
-                    return handle.cancel();
-                }
-                return {false, ECANCELED};
+            if(!this->h.promise().chain){
+                return {false, EAGAIN};
             }
-            return {false, EAGAIN};
+            return this->h.promise().chain->request_cancel();
         }
 
         bool await_ready() const noexcept{
@@ -598,8 +650,14 @@ namespace xnet{
         template<class Promise>
         auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
             auto& promise = h.promise();
-            if constexpr(requires{ promise.chain.father = &caller.promise().chain; }){
-                promise.chain.father = &caller.promise().chain;
+            if constexpr(requires{ promise.chain = caller.promise().chain; }){
+                if(!caller.promise().chain){
+                    promise.chain = caller.promise().chain = new CancelChain(2);
+                }
+                else{
+                    promise.chain = caller.promise().chain;
+                    promise.chain->add_ref();
+                }
             }
             promise.waiter = caller;
             return h;
@@ -850,9 +908,15 @@ namespace xnet{
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
-            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
+            bool await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                if constexpr(requires{ handle.promise().xcoro_hook(this); }){
+                    if(!handle.promise().xcoro_hook(this)){
+                        return false;
+                    }
+                }
+                this->start_all_tasks();
+                return true;
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1010,9 +1074,15 @@ namespace xnet{
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
-            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
+            bool await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                if constexpr(requires{ handle.promise().xcoro_hook(this); }){
+                    if(!handle.promise().xcoro_hook(this)){
+                        return false;
+                    }
+                }
+                this->start_all_tasks();
+                return true;
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1126,9 +1196,15 @@ namespace xnet{
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
-            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
+            bool await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                if constexpr(requires{ handle.promise().xcoro_hook(this); }){
+                    if(!handle.promise().xcoro_hook(this)){
+                        return false;
+                    }
+                }
+                this->start_all_tasks();
+                return true;
             }
 
             std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1297,9 +1373,15 @@ namespace xnet{
             bool await_ready() const noexcept { return false; }
 
             template<class Promise>
-            void await_suspend(std::coroutine_handle<Promise> handle) noexcept {
+            bool await_suspend(std::coroutine_handle<Promise> handle) noexcept {
                 this->handler = handle;
-                return this->start_all_tasks();
+                if constexpr(requires{ handle.promise().xcoro_hook(this); }){
+                    if(!handle.promise().xcoro_hook(this)){
+                        return false;
+                    }
+                }
+                this->start_all_tasks();
+                return true;
             }
 
             Result<await_result_t<Ops>...>& await_resume() noexcept {
@@ -1410,7 +1492,7 @@ namespace xnet{
 
     class io_context{
         io_uring ring{};
-        details::atomic_type<size_t> evs_count;
+        size_t evs_count;
         #ifndef XNET_DISABLE_THREAD_SAFE
         std::atomic_flag spinlock = ATOMIC_FLAG_INIT;
         #endif
@@ -1463,17 +1545,17 @@ namespace xnet{
 
         bool invalid() const noexcept { return ring.ring_fd == -1; }
 
-#ifndef XNET_DISABLE_THREAD_SAFE
-        size_t add_events(size_t n, std::memory_order order = std::memory_order_acq_rel) noexcept{
-            return this->evs_count.fetch_add(n, order) + n;
+        size_t add_events(size_t n) noexcept{
+            return this->evs_count += n;
         }
-        size_t sub_events(size_t n, std::memory_order order = std::memory_order_acq_rel) noexcept{
-            return this->evs_count.fetch_sub(n, order) - n;
+        size_t sub_events(size_t n) noexcept{
+            return this->evs_count -= n;
         }
-        size_t num_evs(std::memory_order order = std::memory_order_acquire) const noexcept {
-            return this->evs_count.load(order);
+        size_t num_evs() const noexcept {
+            return this->evs_count;
         }
 
+#ifndef XNET_DISABLE_THREAD_SAFE
         auto& get_lock() noexcept{ return this->spinlock; }
         void lock() noexcept {
             while(spinlock.test_and_set(std::memory_order_acquire)){
@@ -1487,23 +1569,6 @@ namespace xnet{
 #endif
 
 #ifdef XNET_DISABLE_THREAD_SAFE
-        size_t add_events(size_t n, std::memory_order order = std::memory_order_acq_rel) noexcept{
-            (void)order;
-            size_t seen = this->evs_count;
-            this->evs_count += n;
-            return seen;
-        }
-        size_t sub_events(size_t n, std::memory_order order = std::memory_order_acq_rel) noexcept{
-            (void)order;
-            size_t seen = this->evs_count;
-            this->evs_count -= n;
-            return seen;
-        }
-        size_t num_evs(std::memory_order order = std::memory_order_acquire) const noexcept {
-            (void)order;
-            return this->evs_count;
-        }
-
         auto& get_lock() noexcept{
             static thread_local std::atomic<size_t> dummy;
             return dummy;
@@ -1545,14 +1610,16 @@ namespace xnet{
 
         // basic scheduler for simplicity
         void run_until_complete() noexcept{
-            constexpr size_t CQE_BATCH = 512;
-            io_uring_cqe* cqes[CQE_BATCH];
             if(this->evs_count == 0){
                 return;
             }
+            constexpr size_t CQE_BATCH = 512;
+            io_uring_cqe* cqes[CQE_BATCH];
 
             this->submit_and_wait();
             int& result_slot = xnet::io_context::result();
+            unsigned int num_batch = (this->ring.sq.ring_entries / 4);
+            num_batch = num_batch <= 256 ? num_batch : 256;
             while(true){
                 unsigned int count = io_uring_peek_batch_cqe(&this->ring, cqes, CQE_BATCH);
                 for(unsigned int i = 0; i < count; i++){
@@ -1564,7 +1631,7 @@ namespace xnet{
                         result_slot = cqe->res;
                         handle.resume();
                     }
-                    if((i + 1) % 256 == 0){
+                    if((i + 1) % num_batch == 0){
                         this->submit();
                     }
                 }
@@ -1743,10 +1810,17 @@ namespace xnet{
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->stream.ctx->lock();
                         }
+                        this->handler = h;
+                        auto& result = io_context::result();
+                        if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                            if(!h.promise().xcoro_hook(this)){
+                                result = ECANCELED;
+                                return false;
+                            }
+                        }
 
                         bool suspended = false;
                         unsigned left = io_uring_sq_space_left(&this->stream.ctx->ring);
-                        auto& result = io_context::result();
                         if(left >= 2){
                             io_uring_sqe* sqe1 = io_uring_get_sqe(&this->stream.ctx->ring);
                             io_uring_sqe* sqe2 = io_uring_get_sqe(&this->stream.ctx->ring);
@@ -1758,12 +1832,12 @@ namespace xnet{
                             io_uring_sqe_set_data(sqe2, nullptr);
                             XNET_SET_FLAGS_SKIP_SUCCESS(sqe2);
 
-                            this->handler = h;
                             this->stream.ctx->add_events(1);
                             suspended = true;
                             goto FINALLY;
                         }
-                        result = errno;
+                        this->handler = nullptr;
+                        result = EAGAIN;
                     FINALLY:
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->stream.ctx->unlock();
@@ -1772,7 +1846,6 @@ namespace xnet{
                     }
 
                     details::io_result<size_t> await_resume() noexcept{
-                        this->handler = nullptr;
                         int result = io_context::result();
                         int err = result < 0 ? -result : 0;
                         size_t r = result < 0 ? 0 : static_cast<size_t>(result);
@@ -1836,21 +1909,29 @@ namespace xnet{
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->stream.ctx->lock();
                     }
+
+                    this->handler = h;
+                    auto& result = io_context::result();
+                    if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                        if(!h.promise().xcoro_hook(this)){
+                            result = ECANCELED;
+                            return false;
+                        }
+                    }
                     
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->stream.ctx->ring);
-                    auto& result = io_context::result();
                     if(sqe != nullptr){
                         // prep something
                         this->prep(sqe, std::make_index_sequence<num_args>());
                         io_uring_sqe_set_data(sqe, h.address());
 
-                        this->handler = h;
                         this->stream.ctx->add_events(1);
                         suspended = true;
                         goto FINALLY;
                     }
-                    result = errno;
+                    this->handler = nullptr;
+                    result = EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->stream.ctx->unlock();
@@ -1859,7 +1940,6 @@ namespace xnet{
                 }
 
                 details::io_result<size_t> await_resume() noexcept{
-                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = result < 0 ? -result : 0;
                     size_t r = result < 0 ? 0 : static_cast<size_t>(result);
@@ -2103,9 +2183,16 @@ namespace xnet{
                             this->accepter.ctx->lock();
                         }
 
+                        this->handler = h;
+                        auto& result = io_context::result();
+                        if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                            if(!h.promise().xcoro_hook(this)){
+                                result = ECANCELED;
+                                return false;
+                            }
+                        }
                         unsigned left = io_uring_sq_space_left(&this->accepter.ctx->ring);
                         bool suspended = false;
-                        auto& result = io_context::result();
                         if(left >= 2){
                             io_uring_sqe* sqe1 = io_uring_get_sqe(&this->accepter.ctx->ring);
                             io_uring_sqe* sqe2 = io_uring_get_sqe(&this->accepter.ctx->ring);
@@ -2117,12 +2204,12 @@ namespace xnet{
                             io_uring_sqe_set_data(sqe2, nullptr);
                             XNET_SET_FLAGS_SKIP_SUCCESS(sqe2);
 
-                            this->handler = h;
                             this->accepter.ctx->add_events(1);
                             suspended = true;
                             goto FINALLY;
                         }
-                        result = errno;
+                        this->handler = nullptr;
+                        result = EAGAIN;
                     FINALLY:
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->accepter.ctx->unlock();
@@ -2131,7 +2218,6 @@ namespace xnet{
                     }
 
                     details::io_result<tcp_type> await_resume() noexcept{
-                        this->handler = nullptr;
                         int result = io_context::result();
                         int err = 0;
                         if(result < 0){
@@ -2187,19 +2273,27 @@ namespace xnet{
                         this->accepter.ctx->lock();
                     }
 
+                    this->handler = h;
+                    auto& result = io_context::result();
+                    if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                        if(!h.promise().xcoro_hook(this)){
+                            result = ECANCELED;
+                            return false;
+                        }
+                    }
+
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->accepter.ctx->ring);
-                    auto& result = io_context::result();
                     if(sqe != nullptr){
                         io_uring_prep_accept(sqe, this->accepter.server, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
                         io_uring_sqe_set_data(sqe, h.address());
 
-                        this->handler = h;
                         this->accepter.ctx->add_events(1);
                         suspended = true;
                         goto FINALLY;
                     }
-                    result = errno;
+                    this->handler = nullptr;
+                    result = EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->accepter.ctx->unlock();
@@ -2208,7 +2302,6 @@ namespace xnet{
                 }
 
                 details::io_result<tcp_type> await_resume() noexcept{
-                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = 0;
                     if(result < 0){
@@ -2299,14 +2392,20 @@ namespace xnet{
                         this->timer.ctx->lock();
                     }
                     
+                    this->handler = h;
+                    auto& result = io_context::result();
+                    if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                        if(!h.promise().xcoro_hook(this)){
+                            result = ECANCELED;
+                            return false;
+                        }
+                    }
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->timer.ctx->ring);
-                    auto& result = io_context::result();
                     if(sqe != nullptr){
                         io_uring_prep_timeout(sqe, &this->ts, 0, 0);
                         io_uring_sqe_set_data(sqe, h.address());
 
-                        this->handler = h;
                         this->timer.ctx->add_events(1);
                         suspended = true;
                         goto FINALLY;
@@ -2320,7 +2419,6 @@ namespace xnet{
                 }
 
                 details::io_result<void> await_resume() noexcept{
-                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = result != -ETIME ? -result : 0;
                     if(this->handler){
@@ -2411,19 +2509,27 @@ namespace xnet{
                         this->filesystem.ctx->lock();
                     }
 
+                    this->handler = h;
+                    auto& result = io_context::result();
+                    if constexpr(requires{ h.promise().xcoro_hook(this); }){
+                        if(!h.promise().xcoro_hook(this)){
+                            result = ECANCELED;
+                            return false;
+                        }
+                    }
+
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->filesystem.ctx->ring);
-                    auto& result = io_context::result();
                     if(sqe != nullptr){
                         this->prep(sqe, std::make_index_sequence<num_args>());
                         io_uring_sqe_set_data(sqe, h.address());
 
-                        this->handler = h;
                         this->filesystem.ctx->add_events(1);
                         suspended = true;
                         goto FINALLY;
                     }
-                    result = errno;
+                    this->handler = nullptr;
+                    result = EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->filesystem.ctx->unlock();
@@ -2432,7 +2538,6 @@ namespace xnet{
                 }
 
                 details::io_result<Ret> await_resume() noexcept{
-                    this->handler = nullptr;
                     int result = io_context::result();
                     int err = 0;
                     if(result < 0){
