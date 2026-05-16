@@ -4,13 +4,13 @@
 #include<tuple>
 #include<cerrno>
 #include<coroutine>
-#include<new>
+#include<cstring>
 #include<utility>
 #include<atomic>
 
 // #define XNET_DISABLE_THREAD_SAFE
 #ifdef XNET_DISABLE_THREAD_SAFE
-#pragma message "xnet compiled in thread-unsafe mode: concurrent operations on io_context/stream/awaiters are not safe"
+#pragma message "xnet compiled in thread-unsafe mode"
 #endif
 
 #ifdef __linux__
@@ -527,7 +527,7 @@ namespace xnet{
 
         details::io_result<bool> cancel() noexcept{
             if(!this->h.promise().chain){
-                return {false, EAGAIN};
+                return {false, ECANCELED};
             }
             return this->h.promise().chain->request_cancel();
         }
@@ -638,7 +638,7 @@ namespace xnet{
 
         details::io_result<bool> cancel() noexcept{
             if(!this->h.promise().chain){
-                return {false, EAGAIN};
+                return {false, ECANCELED};
             }
             return this->h.promise().chain->request_cancel();
         }
@@ -919,9 +919,9 @@ namespace xnet{
                 return true;
             }
 
-            std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
+            std::tuple<await_result_t<Ops>...>&& await_resume() noexcept {
                 this->handler = nullptr;
-                return this->result;
+                return std::move(this->result);
             }
         };
 
@@ -933,9 +933,8 @@ namespace xnet{
                 friend class AnyAwaiter;
                 template<size_t... vs>
                 static consteval size_t get_max_value(){
-                    std::initializer_list<size_t> ls = {vs...};
                     size_t max = 0;
-                    for(size_t v : ls){
+                    for(size_t v : {vs...}){
                         max = v > max ? v : max;
                     }
                     return max;
@@ -943,12 +942,49 @@ namespace xnet{
 
                 static constexpr size_t max_size = get_max_value<sizeof(Ts)...>();
                 static constexpr size_t max_align = get_max_value<alignof(Ts)...>();
-                
+
                 int idx = -1;
                 alignas(max_align) unsigned char bytes[max_size];
-            public:
-                int who() const noexcept{ return this->idx; }
 
+                template<size_t I>
+                void try_destroy() noexcept{
+                    if(I == this->idx){
+                        auto& ret = this->get<I>();
+                        using T = typename std::decay<decltype(ret)>::type;
+                        ret.~T();
+                        return;
+                    }
+                    else{
+                        if constexpr(I != (sizeof...(Ts) - 1)){
+                            return try_destroy<I+1>();
+                        }
+                    }
+                }
+            public:
+                Result() = default;
+                Result(const Result&) = delete;
+                Result(Result&& other) noexcept: idx(std::exchange(other.idx, -1)){
+                    if(this->idx >= 0){
+                        std::memcpy(this->bytes, other.bytes, max_size); 
+                    }
+                }
+                Result& operator=(Result&& other) noexcept{
+                    if(this->idx >= 0){
+                        this->try_destroy<0>();
+                    }
+                    this->idx = std::exchange(other.idx, -1);
+                    if(this->idx >= 0){
+                        std::memcpy(this->bytes, other.bytes, max_size); 
+                    }
+                    return *this;
+                }
+                ~Result(){
+                    if(this->idx >= 0){
+                        this->try_destroy<0>();
+                    }
+                }
+                int who() const noexcept { return this->idx; }
+                
                 template<size_t I>
                 struct type{
                     using nth_type = typename std::tuple_element<I, std::tuple<Ts...>>::type;
@@ -956,16 +992,13 @@ namespace xnet{
                 template<size_t I>
                 using type_t = typename type<I>::nth_type;
 
-
                 template<size_t I>
                 type_t<I>& get() noexcept{
                     return reinterpret_cast<type_t<I>&>(bytes);
                 }
-
                 template<size_t I>
-                void destroy() noexcept{
-                    using T = type<I>;
-                    reinterpret_cast<T*>(&bytes)->~T();
+                const type_t<I>& get() const noexcept{
+                    return reinterpret_cast<const type_t<I>&>(bytes);
                 }
             };
 
@@ -999,8 +1032,7 @@ namespace xnet{
                     if(awaiter.done == 1){
                         // first
                         awaiter.result.idx = worker_id;
-                        using result_t = decltype(result);
-                        new (&awaiter.result.bytes) result_t(std::move(result));
+                        awaiter.result.template get<worker_id>() = std::move(result);
                         need_cancel = true;
                     }
                     need_resume = (awaiter.done == num_ops);
@@ -1030,8 +1062,7 @@ namespace xnet{
                             // first success
                             awaiter.done = 1 - awaiter.done;
                             awaiter.result.idx = worker_id;
-                            using result_t = decltype(result);
-                            new (&awaiter.result.bytes) result_t(std::move(result));
+                            awaiter.result.template get<worker_id>() = std::move(result);
                             need_cancel = true;
                         }
                         else{
@@ -1052,6 +1083,7 @@ namespace xnet{
             std::tuple<Ops...> ops;
             Result<await_result_t<Ops>...> result;
             std::coroutine_handle<> handler;
+            int idx;
             int done;
         public:
             static constexpr size_t num_ops = sizeof...(Ops);
@@ -1085,9 +1117,9 @@ namespace xnet{
                 return true;
             }
 
-            Result<await_result_t<Ops>...>& await_resume() noexcept {
+            auto&& await_resume() noexcept{
                 this->handler = nullptr;
-                return this->result;
+                return std::move(this->result);
             }
         };
     };
@@ -1207,9 +1239,9 @@ namespace xnet{
                 return true;
             }
 
-            std::tuple<await_result_t<Ops>...>& await_resume() noexcept {
+            std::tuple<await_result_t<Ops>...>&& await_resume() noexcept {
                 this->handler = nullptr;
-                return this->result;
+                return std::move(this->result);
             }
         };
 
@@ -1220,9 +1252,8 @@ namespace xnet{
                 friend class AnyAwaiter;
                 template<size_t... vs>
                 static consteval size_t get_max_value(){
-                    std::initializer_list<size_t> ls = {vs...};
                     size_t max = 0;
-                    for(size_t v : ls){
+                    for(size_t v : {vs...}){
                         max = v > max ? v : max;
                     }
                     return max;
@@ -1230,12 +1261,49 @@ namespace xnet{
 
                 static constexpr size_t max_size = get_max_value<sizeof(Ts)...>();
                 static constexpr size_t max_align = get_max_value<alignof(Ts)...>();
-                
+
                 int idx = -1;
                 alignas(max_align) unsigned char bytes[max_size];
-            public:
-                int who() const noexcept{ return this->idx; }
 
+                template<size_t I>
+                void try_destroy() noexcept{
+                    if(I == this->idx){
+                        auto& ret = this->get<I>();
+                        using T = typename std::decay<decltype(ret)>::type;
+                        ret.~T();
+                        return;
+                    }
+                    else{
+                        if constexpr(I != (sizeof...(Ts) - 1)){
+                            return try_destroy<I+1>();
+                        }
+                    }
+                }
+            public:
+                Result() = default;
+                Result(const Result&) = delete;
+                Result(Result&& other) noexcept: idx(std::exchange(other.idx, -1)){
+                    if(this->idx >= 0){
+                        std::memcpy(this->bytes, other.bytes, max_size); 
+                    }
+                }
+                Result& operator=(Result&& other) noexcept{
+                    if(this->idx >= 0){
+                        this->try_destroy<0>();
+                    }
+                    this->idx = std::exchange(other.idx, -1);
+                    if(this->idx >= 0){
+                        std::memcpy(this->bytes, other.bytes, max_size); 
+                    }
+                    return *this;
+                }
+                ~Result(){
+                    if(this->idx >= 0){
+                        this->try_destroy<0>();
+                    }
+                }
+                int who() const noexcept { return this->idx; }
+                
                 template<size_t I>
                 struct type{
                     using nth_type = typename std::tuple_element<I, std::tuple<Ts...>>::type;
@@ -1243,16 +1311,13 @@ namespace xnet{
                 template<size_t I>
                 using type_t = typename type<I>::nth_type;
 
-
                 template<size_t I>
                 type_t<I>& get() noexcept{
                     return reinterpret_cast<type_t<I>&>(bytes);
                 }
-
                 template<size_t I>
-                void destroy() noexcept{
-                    using T = type<I>;
-                    reinterpret_cast<T*>(&bytes)->~T();
+                const type_t<I>& get() const noexcept{
+                    return reinterpret_cast<const type_t<I>&>(bytes);
                 }
             };
 
@@ -1283,15 +1348,24 @@ namespace xnet{
                     bool need_cancel = false;
                     bool need_resume = false;
                     
-                    int seen = awaiter.done.fetch_add(1, std::memory_order_acq_rel);
+                    int seen = awaiter.done.fetch_add(2, std::memory_order_acq_rel);
                     if(seen == 0){
                         // first
+                        awaiter.result.template get<worker_id>() = std::move(result);
                         awaiter.result.idx = worker_id;
-                        using result_t = decltype(result);
-                        new (&awaiter.result.bytes) result_t(std::move(result));
-                        need_cancel = true;
+                        int post_seen = awaiter.done.fetch_sub(1, std::memory_order_acq_rel);
+                        if(post_seen == num_ops * 2){
+                            need_resume = true;
+                        }
+                        else{
+                            need_cancel = true;
+                        }
                     }
-                    need_resume = (seen + 1 == num_ops); // last
+                    else{
+                        if(seen + 2 == num_ops * 2 - 1){
+                            need_resume = true;
+                        }
+                    }
 
                     if(need_cancel){ 
                         awaiter.cancel_except<worker_id, 0>(); 
@@ -1314,30 +1388,35 @@ namespace xnet{
                     int seen = awaiter.done.load(std::memory_order_acquire);
                     while(true){
                         int new_val;
+                        need_cancel = false;
                         if(ok){
                             if(seen > 0){
-                                new_val = seen + 1;
+                                new_val = seen + 2;
                             }
                             else{
                                 need_cancel = true;
-                                new_val = 1 - seen;
+                                new_val = 2 - seen;
                             }
                         }
                         else{
-                            new_val = (seen > 0 ? seen + 1 : seen - 1);
+                            new_val = (seen > 0 ? seen + 2 : seen - 2);
                         }
                         if(awaiter.done.compare_exchange_weak(seen, new_val, std::memory_order_acq_rel)){
-                            int completed = (new_val >= 0 ? new_val : -new_val);
-                            need_resume = completed == num_ops;
+                            need_resume = (new_val == (num_ops * 2 - 1)) || (-new_val == num_ops * 2);
                             break;
                         }
                     }
 
                     if(need_cancel){
+                        awaiter.result.template get<worker_id>() = std::move(result);
                         awaiter.result.idx = worker_id;
-                        using result_t = decltype(result);
-                        new (&awaiter.result.bytes) result_t(std::move(result));
-                        awaiter.cancel_except<worker_id, 0>(); 
+                        int post_seen = awaiter.done.fetch_sub(1, std::memory_order_acq_rel);
+                        if(post_seen == num_ops * 2){
+                            need_resume = true;
+                        }
+                        else{
+                            awaiter.cancel_except<worker_id, 0>(); 
+                        }
                     }
                     if(need_resume){
                         awaiter.handler.resume();
@@ -1384,9 +1463,9 @@ namespace xnet{
                 return true;
             }
 
-            Result<await_result_t<Ops>...>& await_resume() noexcept {
+            auto&& await_resume() noexcept{
                 this->handler = nullptr;
-                return this->result;
+                return std::move(this->result);
             }
         };
     };
@@ -1789,6 +1868,10 @@ namespace xnet{
 
 
                     details::io_result<bool> cancel() noexcept{
+                        if(this->handler == nullptr){
+                            return {false, ECANCELED};
+                        }
+
                         if constexpr(details::is_poll_add<prep_func>::value){
                             using func_type = decltype(details::prep_poll_remove);
                             using data_type = unsigned long long;
@@ -1887,6 +1970,10 @@ namespace xnet{
                 }
 
                 details::io_result<bool> cancel() noexcept{
+                    if(this->handler == nullptr){
+                        return {false, ECANCELED};
+                    }
+
                     if constexpr(details::is_poll_add<prep_func>::value){
                         using func_type = decltype(details::prep_poll_remove);
                         using data_type = unsigned long long;
@@ -2168,6 +2255,9 @@ namespace xnet{
                     CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                     details::io_result<bool> cancel() noexcept{
+                        if(this->handler == nullptr){
+                            return {false, ECANCELED};
+                        }
                         using func_type = decltype(io_uring_prep_cancel);
                         using data_type = void*;
                         return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
@@ -2258,6 +2348,9 @@ namespace xnet{
                 }
 
                 details::io_result<bool> cancel() noexcept{
+                    if(this->handler == nullptr){
+                        return {false, ECANCELED};
+                    }
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
                     return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
@@ -2371,6 +2464,9 @@ namespace xnet{
                 CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
+                    if(this->handler == nullptr){
+                        return {false, ECANCELED};
+                    }
                     using func_type = decltype(io_uring_prep_timeout_remove);
                     using data_type = unsigned long long;
                     return io_context::cancel<func_type, io_uring_prep_timeout_remove, data_type>(
@@ -2494,6 +2590,9 @@ namespace xnet{
                 CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
+                    if(this->handler == nullptr){
+                        return {false, ECANCELED};
+                    }
                     using func_type = decltype(io_uring_prep_cancel);
                     using data_type = void*;
                     return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(

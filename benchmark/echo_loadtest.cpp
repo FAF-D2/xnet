@@ -155,7 +155,7 @@ xnet::detached_task client_task(xnet::io_context& ctx, int id){
         while(true){
             auto start = std::chrono::steady_clock::now();
 
-            auto& [r1, r2] = co_await xnet::all(
+            auto [r1, r2] = co_await xnet::all(
                 client.send(sendbuf, payload_size, 0),
                 client.recv(recvbuf, payload_size, MSG_WAITALL)
             );
