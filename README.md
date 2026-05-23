@@ -1,7 +1,7 @@
 # xnet
 
 ## About this project
-xnet is a **lightweight, ~2k-line, header-only** async I/O layer that exposes minimal awaiters built on **io_uring (via liburing)** and **C++20 coroutines**.
+xnet is a **lightweight, ~3k-line, header-only** async I/O layer that exposes minimal awaiters built on **io_uring (via liburing)** and **C++20 coroutines**.
 
 It does **one thing only**: fast, minimal, scheduler‑agnostic asynchronous I/O — with each IOAwaiter costing only **32–64 bytes** of overhead.
 
@@ -65,8 +65,6 @@ Each client sends a 500‑byte echo request every 0–20 ms (uniform random), me
 
 
 
-
-
 ## Some Examples
 *See more examples in the [examples/](./examples/) directory.*
 
@@ -93,6 +91,8 @@ xnet::task<> accept_loop(xnet::io_context& ctx) {
 }
 ```
 You will need to write your own scheduler as xnet do not assume any schedular scenario *(multi-threads, single-thread, etc.)*. A possible implementation is:
+
+For simplicity use, or you can just use ctx.run_until_complete() for a basic scheduler
 ```cpp
 void my_scheduler(xnet::io_context& ctx){
     io_uring* ring = ctx.native();
@@ -128,14 +128,18 @@ int main(){
 
     // scheduler
     my_scheduler();
+    // or
+    // ctx.run_until_complete();
 }
 ```
 
 Also, xnet provides some async combinators (all, allSettled, any, race) that can simply group the coroutine
 
 ```cpp
+auto result = co_await xnet::race(coro1, coro2, coro3);
 auto result = co_await xnet::any(coro1, coro2, coro3);
 auto result = co_await xnet::all(coro1, coro2, coro3);
+auto result = co_await xnet::allSettled(coro1, coro2, coro3);
 ```
 
 
@@ -151,7 +155,7 @@ Your scheduler must call `io_context.submit()` at a suitable time to flush all p
 
 **If you do not call `submit()`, you will never receive a CQE and the coroutine will never resume.**
 ___
-2. When a CQE arrives, write `cqe->res` into the thread‑local result slot `io_context::result()` **immediately before** `resume()`. It acts as the register value that will be readed immediately by the IOAwaiter in `await_resume()`
+2. If you want to define your own scheduler, when a CQE arrives, write `cqe->res` into the thread‑local result slot `io_context::result()` **immediately before** `resume()`. It acts as the register value that will be readed immediately by the IOAwaiter in `await_resume()`
 
 ```cpp
     io_uring_cqe* cqe = cqes[i];
@@ -171,13 +175,7 @@ if(result.err) // err handling
 size_t readed_bytes = *result;
 ```
 
-4. **xnet strictly define the ownership model of the IOAwaiters**: at any moment, an IOAwaiters should always be **owned by exactly only one entity**. Concretly:
-+ An IOAwaiter is either owned by the io_uring backend (while the operation is in-flight co_awaiting)
-+ or owned by only one entity (before submission or after completion).
-
-If you need to share an IOAwaiter across multiple coroutines or threads (e.g. cancellation), you might wrap it in a smart pointer to state the shared ownership. 
-
-For examples and detailed reasoning, See the following section [Cancellation mechanism](#cancellation-mechanism).
+4. Always turn on the MACRO `XNET_DISABLE_THREAD_SAFE` if you do not use io_context and any tasks across threads
 
 ## API Overview
 
@@ -189,8 +187,8 @@ Owns the io_uring instance and provides `submit()`,  `result()`, and all interfa
 Result type returned by all IO awaiters: { T value, int err }.
 Use *result or result->func() to access the value when err == 0.
 
-3. `xnet::task<T> / xnet::detached_task`  
-Coroutine types for user coroutines. detached_task is a fire & forget coroutine
+3. `xnet::task<T> / xnet::detached_task / xnet::ptask<T>`  
+Coroutine types for user coroutines. detached_task is a fire & forget coroutine, ptask is the pure task type if you dont care about cancellation
 
 4. `IOSender type`
     + `TCPAccepter`, `AsyncTimer`: e.g. co_await accepter.accept() -> `io_result<TCPServer>`
@@ -201,58 +199,48 @@ Coroutine types for user coroutines. detached_task is a fire & forget coroutine
 
 5. Async combinators `any`, `race`, `all`, `allSettled`
 
+6. Safe Cancellation
+
+See `examples/cancel_chain.cpp` for more details
+
+```cpp
+xnet::task<> coro(){
+    // ...
+}
+
+auto task = coro();
+auto token = task.cancel_token();
+// pass token to other coroutines or threads
+co_await task;
+```
+
 ## Cancellation mechanism
-xnet does not use a “cancellation token + check‑on‑resume” model.
-Instead, xnet requires users to explicitly manage the shared state of an IOAwaiter (see Contract 4).
+xnet provides the ref-count model for cancellation in task type. If you do care about overhead, use `xnet::ptask` instead.
+The overhead of hooking cancellation chain is 40-50 cycles (~20ns) in thread_safe mode each `await_suspend`.
 
-The following example shows a typical misuse that results in a use‑after‑free:
+Each IOAwaiter will write their cancel fatpointer in a common-space shared by all nodes in the coroutines tree and then modify task state in the call chain in the recursion. So the cancellation of a task will not affect the whole tree but only the chain in its fanouts.
 
+The cancellation usage:
 ```cpp
+xnet::io_context ctx;
+xnet::AsyncTimer timer(ctx);
+
 template<class T>
-xnet::detached_task cancel_after_time(T&& awaiter, int timed){
-    // an example
-    // multi-threads scenario is similar
-    AsyncTimer timer(awaiter.context());
+xnet::detached_task cancel_after_time(T token, int timed){
     co_await timer.timeout(timed);
-    awaiter.cancel(); // boom: awaiter use after free !!!!
+    auto ret = token.cancel();
 }
 
 xnet::task<size_t> func(xnet::TCPServer s){
-    auto awaiter = s.recv(...);
-    cancel_after_time(awaiter, 10);
-    auto result = co_await awaiter; // awaiter returned within 10s
-    co_return *result; // func returned and destroyed the awaiter
-    // at 10s the cancel_after_time execute ``awaiter.cancel()``
+    auto task = some_task();
+    cancel_after_time(task.cancel_token(), 10);
+    co_await task;
 }
 ```
-
-The correct implementation should be:
-```cpp
-template<class T>
-xnet::detached_task cancel_after_time(T awaiter, int timed){
-    AsyncTimer timer(awaiter->context());
-    co_await timer.timeout(timed);
-    awaiter->cancel(); // safe
-}
-
-xnet::task<size_t> func(xnet::TCPServer s){
-    // *(the ownership of IOAwaiter is owned by the shared_ptr now)*
-    using awaiter_t = decltype(s.recv(...));
-    auto shared_awaiter = std::make_shared<awaiter_t>(s.recv(...));
-
-    cancel_after_time(shared_awaiter, 10);
-    auto result = co_await *shared_awaiter; // awaiter returned within 10s
-    co_return *result;
-    // func returned and destroyed the shared_ptr
-    // at 10s the cancel_after_time execute ``awaiter.cancel()``
-}
-```
-
-Benefit from the exclusive ownership, the `task<>::cancel()` can just simply send the cancel signal to io_uring if the coroutine is awaiting the IOAwaiter, and the coroutine will **never** resume immediately as the io_uring is taking the ownership at this time. 
 
 The return value of `cancel()` is io_result\<bool\>:
 + {true, 0} cancel signal sended, will cancel the actual IO if it is not completed
 + {false, EAGAIN}  the coroutine is not suspended or suspended failed (Get SQE error)
 + {false, ECANCELLED} (the coroutine is already finished)
 
-For fully control to the behaviour of your coroutine cancellation, you might decide your own task type with promise_type by refering to the implementation of `cancel()` and `xcoro_hook()` (hooked in `await_suspend()` by all IOAwaiters) in task\<T\> as well.
+Implement a correct task type with correct cancellation implementation is hard, so it is recommended that use the `task<>` directly if you need cancellation or `ptask<>` if you do not care about the cancellation.

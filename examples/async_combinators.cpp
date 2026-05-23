@@ -14,7 +14,8 @@ void my_scheduler(xnet::io_context& ctx);
 int main() {
     xnet::io_context ctx(128);
     run_all_demos(ctx);
-    my_scheduler(ctx);
+    // my_scheduler(ctx);
+    ctx.run_until_complete();
     return 0;
 }
 

@@ -77,10 +77,10 @@ namespace xnet{
         template<int placeholder>
         struct GET_ADDRTYPE<AF_LOCAL, placeholder>{ using type = sockaddr_un; };
 
-        static void prep_sendfile(io_uring_sqe* sqe, int sockfd, int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept{
+        static inline void prep_sendfile(io_uring_sqe* sqe, int sockfd, int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept{
             ::io_uring_prep_splice(sqe, filefd, offset, sockfd, -1, bytes, flags);
         }
-        static void prep_poll_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
+        static inline void prep_poll_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
             (void)flags;
             return ::io_uring_prep_poll_remove(sqe, user_data);
         }
@@ -272,7 +272,7 @@ namespace xnet{
             bool rst() const noexcept { return this->err == ECONNRESET; }
         };
 
-        template<class Awaiter, class Promise, class suspend_ret_t>
+        template<class Awaiter, class Promise>
         struct Wrapper {
             Awaiter a;
 
@@ -285,199 +285,193 @@ namespace xnet{
             }
 
             auto await_resume() noexcept(noexcept(a.await_resume())){
-                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                    auto h = std::coroutine_handle<Promise>::from_address(a.handle().address());
-                    h.promise().xcoro_unhook();
-                }
-                return a.await_resume();
-            }
-        };
-
-        template<class Awaiter, class Promise>
-        struct Wrapper<Awaiter, Promise, void>{
-            Awaiter a;
-
-            bool await_ready() noexcept(noexcept(a.await_ready())){
-                return a.await_ready();
-            }
-            
-            auto await_suspend(std::coroutine_handle<Promise> h) noexcept(noexcept(a.await_suspend(h))){
-                return a.await_suspend(h);
-            }
-
-            auto await_resume() noexcept(noexcept(a.await_resume())){
-                if constexpr(requires{ a.cancelhandle(); } && requires{ a.handle(); }){
-                    auto h = std::coroutine_handle<Promise>::from_address(a.handle().address());
-                    h.promise().xcoro_unhook();
-                }
-                return a.await_resume();
-            }
-        };
-    };
-
-    struct CancelHandle{
-        template<class T>
-        static details::io_result<bool> call_traits(void* p) noexcept{
-            return (*static_cast<T*>(p)).cancel();
-        }
-
-        typedef details::io_result<bool>(*Call)(void*);
-
-        Call call_func;
-        void* p;
-    public:
-        CancelHandle() = default;
-        ~CancelHandle() = default;
-        CancelHandle(const CancelHandle&) = default;
-        CancelHandle& operator=(const CancelHandle&) = default;
-        template<class T>
-        CancelHandle(T* t) noexcept: call_func(call_traits<T>), p(t)
-        {}
-        
-        details::io_result<bool> cancel() noexcept { return this->call_func(this->p); }
-        bool invalid() const noexcept { return this->p == nullptr; }
-        void reset() noexcept { this->p = nullptr; }
-    };
-#ifndef XNET_DISABLE_THREAD_SAFE
-    // state:
-    // 00 --- not suspended && not cancelled request
-    // 01 --- not suspended && cancelled request
-    // 10 --- suspended && not cancelled request
-    // 11 --- suspended && cancelled request
-    class CancelChain{
-        CancelHandle cancelhandle;
-        std::atomic<int> use_count = 1;
-        std::atomic<int> state = 0b00;
-    public:
-        CancelChain(int ref) noexcept: cancelhandle(), use_count(ref), state(0b00)
-        {}
-
-        details::io_result<bool> request_cancel() noexcept{
-            int expected = this->state.load(std::memory_order_acquire);
-            while(true){
-                if(expected & 0b01){
-                    return {true, 0};
-                }
-
-                int desired = expected | 0b01;
-                if(state.compare_exchange_weak(expected, desired, std::memory_order_acq_rel)){
-                    if(expected == 0b10){
-                        return this->cancelhandle.cancel();
+                if constexpr(requires{ a.handle(); }){
+                    if(a.handle() != nullptr){
+                        auto h = std::coroutine_handle<Promise>::from_address(a.handle().address());
+                        h.promise().xcoro_unhook();
                     }
-                    return {true, 0};
+                }
+                return a.await_resume();
+            }
+        };
+
+        struct CancelHandle{
+            template<class T>
+            static details::io_result<bool> call_traits(void* p) noexcept{
+                return (*static_cast<T*>(p)).cancel();
+            }
+
+            typedef details::io_result<bool>(*Call)(void*);
+
+            Call call_func;
+            void* p;
+        public:
+            CancelHandle() = default;
+            ~CancelHandle() = default;
+            CancelHandle(const CancelHandle&) = default;
+            CancelHandle& operator=(const CancelHandle&) = default;
+            template<class T>
+            CancelHandle(T* t) noexcept: call_func(call_traits<T>), p(t)
+            {}
+            
+            details::io_result<bool> cancel() noexcept { return this->call_func(this->p); }
+            bool invalid() const noexcept { return this->p == nullptr; }
+            void reset() noexcept { this->p = nullptr; }
+        };
+
+#ifndef XNET_DISABLE_THREAD_SAFE
+        struct alignas(64) CancelChain{
+            CancelHandle cancelhandle;
+            std::atomic<int> use_count = 1;
+            std::atomic_flag spinlock = ATOMIC_FLAG_INIT;
+
+            void lock() noexcept {
+                while(spinlock.test_and_set(std::memory_order_acquire)){
+                    spinlock.wait(true, std::memory_order_relaxed);
                 }
             }
-        }
-
-        bool hook(const CancelHandle& handle) noexcept{
-            this->cancelhandle = handle;
-            int expected = 0b00;
-            if(!state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
-                return false;
+            void unlock() noexcept{
+                spinlock.clear(std::memory_order_release);
             }
-            return true;
-        }
 
-        void unhook() noexcept{
-            this->state.fetch_and(0b01, std::memory_order_release);
-        }
-
-        int add_ref() noexcept{ 
-            return this->use_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-        }
-        int dec_ref() noexcept{ 
-            return this->use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        }
-    };
-#else
-    class CancelChain{
-        CancelHandle cancelhandle;
-        int use_count = 1;
-        int state = 0b00;
-    public:
-        CancelChain(int ref) noexcept: cancelhandle(), use_count(ref), state(0b00)
-        {}
-
-        details::io_result<bool> request_cancel() noexcept{
-            int expected = this->state;
-            this->state = expected | 0b01;
-            if(expected == 0b10){
-                return this->cancelhandle.cancel();
+            int add_ref() noexcept{
+                return this->use_count.fetch_add(1, std::memory_order_acq_rel) + 1;
             }
-            return {true, 0};
-        }
-
-        bool hook(const CancelHandle& handle) noexcept{
-            if(this->state & 0b01){
-                return false;
+            int dec_ref() noexcept{
+                return this->use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
             }
-            this->cancelhandle = handle;
-            this->state = 0b10;
-            return true;
-        }
-
-        void unhook() noexcept{
-            this->state &= 0b01;
-        }
-
-        int add_ref() noexcept{ return ++this->use_count; }
-        int dec_ref() noexcept{ return --this->use_count; }
-    };
-#endif
-
-    struct detached_task {
-        struct promise_type {
-            detached_task get_return_object() noexcept { return {}; }
-            static detached_task get_return_object_on_allocation_failure() noexcept { return {}; }
-
-            std::suspend_never initial_suspend() noexcept { return {}; }
-            std::suspend_never final_suspend() noexcept { return {}; }
-
-            void return_void() noexcept {}
-            void unhandled_exception() noexcept {}
         };
-    };
 
-    template<typename T = void>
-    struct task {
-        struct promise_type {
-            CancelChain* chain = nullptr;
+        struct alignas(64) shared_cancel_chain{
+            std::atomic<shared_cancel_chain*> parent = nullptr;
+            std::atomic<CancelChain*> chain = nullptr;
+            std::atomic<int> state = 0b00;
+            std::atomic<int> use_count = 1;
+        };
+
+        template<class T, class Task>
+        struct cancelable_promise_type{
+            using promise_type = cancelable_promise_type<T, Task>;
+            shared_cancel_chain data;
+
             std::coroutine_handle<> waiter = nullptr;
+
             T value{};
 
-            ~promise_type(){
-                if(this->chain && this->chain->dec_ref() == 0){
-                    delete this->chain;
+            ~cancelable_promise_type(){
+                CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                if(chain && chain->dec_ref() == 0){
+                    delete chain;
                 }
+            }
+
+            bool xcoro_hook_recursion(shared_cancel_chain* node) noexcept{
+                int expected = 0b00;
+                if(!node->state.compare_exchange_strong(expected, 0b10, std::memory_order_release, std::memory_order_relaxed)){
+                    return false;
+                }
+                shared_cancel_chain* next = node->parent.load(std::memory_order_acquire);
+                if(next){
+                    if(!xcoro_hook_recursion(next)){
+                        node->state.fetch_and(0b01, std::memory_order_relaxed);
+                        return false;
+                    }
+                }
+                return true;
             }
 
             template<class IO>
             bool xcoro_hook(IO* io) noexcept{
-                if(!this->chain){
-                    this->chain = new CancelChain(1);
+                CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                if(!chain){
+                    // root
+                    this->data.chain.store(new CancelChain{CancelHandle(io), 1}, std::memory_order_release);
+                    int expected = 0b00;
+                    if(!this->data.state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
+                        return false;
+                    }
+                    return true;
                 }
-                return this->chain->hook(io->cancelhandle());
+                else{
+                    // other
+                    shared_cancel_chain* node = this->data.parent.load(std::memory_order_acquire);
+                    chain->lock();
+                    chain->cancelhandle = CancelHandle(io);
+                    int expected = 0b00;
+                    if(!this->data.state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
+                        chain->unlock();
+                        return false;
+                    }
+                    if(node == nullptr){
+                        chain->unlock();
+                        return true;
+                    }
+                    if(!xcoro_hook_recursion(node)){
+                        this->data.state.fetch_and(0b01, std::memory_order_release);
+                        chain->unlock();
+                        return false;
+                    }
+
+                    chain->unlock();
+                    return true;
+                }
             }
 
             void xcoro_unhook() noexcept{
-                return this->chain->unhook();
+                shared_cancel_chain* node = &this->data;
+                while(node){
+                    node->state.fetch_and(0b01, std::memory_order_release);
+                    node = node->parent.load(std::memory_order_acquire);
+                }
+            }
+
+            details::io_result<bool> request_cancel() noexcept{
+                int expected = this->data.state.load(std::memory_order_acquire);
+                while(true){
+                    if(expected & 0b01){
+                        return {true, 0};
+                    }
+
+                    int desired = expected | 0b01;
+                    if(this->data.state.compare_exchange_weak(expected, desired, std::memory_order_acq_rel)){
+                        if(expected == 0b10){
+                            CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                            chain->lock();
+                            // check one more time if hook failed or unhook
+                            if(this->data.state.load(std::memory_order_acquire) & 0b10){
+                                details::io_result<bool> ret = chain->cancelhandle.cancel();
+                                chain->unlock();
+                                return ret;
+                            }
+                            chain->unlock();
+                        }
+                        return {true, 0};
+                    }
+                }
+                return {true, 0};
+            }
+
+            int add_ref() noexcept{
+                return this->data.use_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+            }
+
+            int dec_ref() noexcept{
+                return this->data.use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
             }
 
             template<class Awaiter>
             auto await_transform(Awaiter&& awaiter) noexcept{
-                using coro_handle_t = std::coroutine_handle<promise_type>;
-                using suspend_ret_t = decltype(awaiter.await_suspend(std::declval<coro_handle_t>()));
-                return details::Wrapper<Awaiter, promise_type, suspend_ret_t>{std::forward<Awaiter>(awaiter)};
+                return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
 
-            task<T> get_return_object() noexcept {
-                return task<T>{
+            Task get_return_object() noexcept {
+                return Task{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
             }
 
-            static task<T> get_return_object_on_allocation_failure() noexcept{
-                return task<T>{nullptr};
+            static Task get_return_object_on_allocation_failure() noexcept{
+                return Task{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -507,95 +501,127 @@ namespace xnet{
             void unhandled_exception() noexcept {}
         };
 
-        std::coroutine_handle<promise_type> h = nullptr;
+        template<class Task>
+        struct cancelable_promise_type<void, Task>{
+            using promise_type = cancelable_promise_type<void, Task>;
+            shared_cancel_chain data;
 
-        task(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
-        task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
-        void operator=(task&& other) noexcept{
-            if(this->h) this->h.destroy();
-            this->h = std::exchange(other.h, nullptr);
-        }
-        task(const task&) = delete;
-
-        ~task() {
-            if (h){
-                h.destroy();
-            }
-        }
-
-        bool invalid() const noexcept { return this->h == nullptr; }
-
-        details::io_result<bool> cancel() noexcept{
-            if(!this->h.promise().chain){
-                return {false, ECANCELED};
-            }
-            return this->h.promise().chain->request_cancel();
-        }
-
-        bool await_ready() const noexcept{
-            return !h || h.done();
-        }
-
-        template<class Promise>
-        auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
-            auto& promise = h.promise();
-            if constexpr(requires{ promise.chain = caller.promise().chain; }){
-                if(!caller.promise().chain){
-                    promise.chain = caller.promise().chain = new CancelChain(2);
-                }
-                else{
-                    promise.chain = caller.promise().chain;
-                    promise.chain->add_ref();
-                }
-            }
-            promise.waiter = caller;
-            return h;
-        }
-
-        T await_resume() noexcept{
-            return std::move(h.promise().value);
-        }
-    };
-
-    template<>
-    struct task<void> {
-        struct promise_type{
-            CancelChain* chain;
             std::coroutine_handle<> waiter = nullptr;
 
-            ~promise_type(){
-                if(this->chain && this->chain->dec_ref() == 0){
-                    delete this->chain;
+            ~cancelable_promise_type(){
+                CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                if(chain && chain->dec_ref() == 0){
+                    delete chain;
                 }
+            }
+
+            bool xcoro_hook_recursion(shared_cancel_chain* node) noexcept{
+                int expected = 0b00;
+                if(!node->state.compare_exchange_strong(expected, 0b10, std::memory_order_release, std::memory_order_relaxed)){
+                    return false;
+                }
+                shared_cancel_chain* next = node->parent.load(std::memory_order_acquire);
+                if(next){
+                    if(!xcoro_hook_recursion(next)){
+                        node->state.fetch_and(0b01, std::memory_order_relaxed);
+                        return false;
+                    }
+                }
+                return true;
             }
 
             template<class IO>
             bool xcoro_hook(IO* io) noexcept{
-                if(!this->chain){
-                    this->chain = new CancelChain(1);
+                CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                if(!chain){
+                    // root
+                    this->data.chain.store(new CancelChain{CancelHandle(io), 1}, std::memory_order_release);
+                    int expected = 0b00;
+                    if(!this->data.state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
+                        return false;
+                    }
+                    return true;
                 }
-                return this->chain->hook(io->cancelhandle());
+                else{
+                    // other
+                    shared_cancel_chain* node = this->data.parent.load(std::memory_order_acquire);
+                    chain->lock();
+                    chain->cancelhandle = CancelHandle(io);
+                    int expected = 0b00;
+                    if(!this->data.state.compare_exchange_strong(expected, 0b10, std::memory_order_release)){
+                        chain->unlock();
+                        return false;
+                    }
+                    if(node == nullptr){
+                        chain->unlock();
+                        return true;
+                    }
+                    if(!xcoro_hook_recursion(node)){
+                        this->data.state.fetch_and(0b01, std::memory_order_release);
+                        chain->unlock();
+                        return false;
+                    }
+
+                    chain->unlock();
+                    return true;
+                }
             }
 
             void xcoro_unhook() noexcept{
-                return this->chain->unhook();
+                shared_cancel_chain* node = &this->data;
+                while(node){
+                    node->state.fetch_and(0b01, std::memory_order_release);
+                    node = node->parent.load(std::memory_order_acquire);
+                }
+            }
+
+            details::io_result<bool> request_cancel() noexcept{
+                int expected = this->data.state.load(std::memory_order_acquire);
+                while(true){
+                    if(expected & 0b01){
+                        return {true, 0};
+                    }
+
+                    int desired = expected | 0b01;
+                    if(this->data.state.compare_exchange_weak(expected, desired, std::memory_order_acq_rel)){
+                        if(expected == 0b10){
+                            CancelChain* chain = this->data.chain.load(std::memory_order_acquire);
+                            chain->lock();
+                            // check one more time if hook failed or unhook
+                            if(this->data.state.load(std::memory_order_acquire) & 0b10){
+                                details::io_result<bool> ret = chain->cancelhandle.cancel();
+                                chain->unlock();
+                                return ret;
+                            }
+                            chain->unlock();
+                        }
+                        return {true, 0};
+                    }
+                }
+                return {true, 0};
+            }
+
+            int add_ref() noexcept{
+                return this->data.use_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+            }
+
+            int dec_ref() noexcept{
+                return this->data.use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
             }
 
             template<class Awaiter>
             auto await_transform(Awaiter&& awaiter) noexcept{
-                using coro_handle_t = std::coroutine_handle<promise_type>;
-                using suspend_ret_t = decltype(awaiter.await_suspend(std::declval<coro_handle_t>()));
-                return details::Wrapper<Awaiter, promise_type, suspend_ret_t>{std::forward<Awaiter>(awaiter)};
+                return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
 
-            task<void> get_return_object() noexcept {
-                return task<void>{
+            Task get_return_object() noexcept {
+                return Task{
                     std::coroutine_handle<promise_type>::from_promise(*this)
                 };
             }
 
-            static task<void> get_return_object_on_allocation_failure() noexcept{
-                return task<void>{nullptr};
+            static Task get_return_object_on_allocation_failure() noexcept{
+                return Task{nullptr};
             }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
@@ -617,30 +643,299 @@ namespace xnet{
 
             void unhandled_exception() noexcept {}
         };
+#else
+        struct CancelChain{
+            CancelHandle cancelhandle;
+            int use_count = 1;
+        
+            int add_ref() noexcept{ return ++use_count; }
+            int dec_ref() noexcept{ return --use_count; }
+        };
 
-        std::coroutine_handle<promise_type> h;
+        struct shared_cancel_chain{
+            shared_cancel_chain* parent = nullptr;
+            CancelChain* chain = nullptr;
+            int state = 0b00;
+            int use_count = 1;
+        };
+
+        template<class T, class Task>
+        struct cancelable_promise_type{
+            using promise_type = cancelable_promise_type<T, Task>;
+            shared_cancel_chain data;
+
+            std::coroutine_handle<> waiter = nullptr;
+
+            T value{};
+
+            ~cancelable_promise_type(){
+                CancelChain* chain = this->data.chain;
+                if(chain && chain->dec_ref() == 0){
+                    delete chain;
+                }
+            }
+
+            bool xcoro_hook_recursion(shared_cancel_chain* node) noexcept{
+                if(node->state != 0b00){
+                    return false;
+                }
+                node->state = 0b10;
+                shared_cancel_chain* next = node->parent;
+                if(next){
+                    if(!xcoro_hook_recursion(next)){
+                        node->state &= 0b01;
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            template<class IO>
+            bool xcoro_hook(IO* io) noexcept{
+                CancelChain* chain = this->data.chain;
+                if(!chain){
+                    // root
+                    if(this->data.state != 0b00){
+                        return false;
+                    }
+                    this->data.chain = new CancelChain{CancelHandle(io), 1};
+                    this->data.state = 0b10;
+                    return true; 
+                }
+                else{
+                    shared_cancel_chain* node = this->data.parent;
+                    chain->cancelhandle = CancelHandle(io);
+                    if(this->data.state != 0b00){
+                        return false;
+                    }
+                    this->data.state = 0b10;
+                    if(!node){
+                        return true;
+                    }
+                    if(!xcoro_hook_recursion(node)){
+                        this->data.state &= 0b01;
+                        return false;
+                    }
+                    return true;
+                }
+            }
+
+            void xcoro_unhook() noexcept{
+                shared_cancel_chain* node = &this->data;
+                while(node){
+                    node->state &= 0b01;
+                    node = node->parent;
+                }
+            }
+
+            details::io_result<bool> request_cancel() noexcept{
+                int expected = this->data.state;
+                this->data.state &= 0b01;
+                if(expected == 0b10){
+                    return this->data.chain->cancelhandle.cancel();
+                }
+                return {true, 0};
+            }
+
+            int add_ref() noexcept{ return ++this->data.use_count; }
+            int dec_ref() noexcept{ return --this->data.use_count; }
+
+            template<class Awaiter>
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
+            }
+
+            Task get_return_object() noexcept {
+                return Task{
+                    std::coroutine_handle<promise_type>::from_promise(*this)
+                };
+            }
+
+            static Task get_return_object_on_allocation_failure() noexcept{
+                return Task{nullptr};
+            }
+
+            std::suspend_always initial_suspend() noexcept { return {}; }
+
+            auto final_suspend() noexcept{
+                struct awaiter{
+                    bool await_ready() const noexcept { return false; }
+                    std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept{
+                        auto w = h.promise().waiter;
+                        return w ? w : std::noop_coroutine();
+                    }
+
+                    void await_resume() const noexcept {}
+                };
+                return awaiter{};
+            }
+
+            template<class V>
+            void return_value(V&& v) noexcept{
+                this->value = T(std::forward<V>(v));
+            }
+
+            void return_value(T&& v) noexcept {
+                value = std::move(v);
+            }
+
+            void unhandled_exception() noexcept {}
+        };
+
+        template<class Task>
+        struct cancelable_promise_type<void, Task>{
+            using promise_type = cancelable_promise_type<void, Task>;
+            shared_cancel_chain data;
+
+            std::coroutine_handle<> waiter = nullptr;
+
+            ~cancelable_promise_type(){
+                CancelChain* chain = this->data.chain;
+                if(chain && chain->dec_ref() == 0){
+                    delete chain;
+                }
+            }
+
+            bool xcoro_hook_recursion(shared_cancel_chain* node) noexcept{
+                if(node->state != 0b00){
+                    return false;
+                }
+                node->state = 0b10;
+                shared_cancel_chain* next = node->parent;
+                if(next){
+                    if(!xcoro_hook_recursion(next)){
+                        node->state &= 0b01;
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            template<class IO>
+            bool xcoro_hook(IO* io) noexcept{
+                CancelChain* chain = this->data.chain;
+                if(!chain){
+                    // root
+                    if(this->data.state != 0b00){
+                        return false;
+                    }
+                    this->data.chain = new CancelChain{CancelHandle(io), 1};
+                    this->data.state = 0b10;
+                    return true; 
+                }
+                else{
+                    shared_cancel_chain* node = this->data.parent;
+                    chain->cancelhandle = CancelHandle(io);
+                    if(this->data.state != 0b00){
+                        return false;
+                    }
+                    this->data.state = 0b10;
+                    if(!node){
+                        return true;
+                    }
+                    if(!xcoro_hook_recursion(node)){
+                        this->data.state &= 0b01;
+                        return false;
+                    }
+                    return true;
+                }
+            }
+
+            void xcoro_unhook() noexcept{
+                shared_cancel_chain* node = &this->data;
+                while(node){
+                    node->state &= 0b01;
+                    node = node->parent;
+                }
+            }
+
+            details::io_result<bool> request_cancel() noexcept{
+                int expected = this->data.state;
+                this->data.state &= 0b01;
+                if(expected == 0b10){
+                    return this->data.chain->cancelhandle.cancel();
+                }
+                return {true, 0};
+            }
+
+            int add_ref() noexcept{ return ++this->data.use_count; }
+            int dec_ref() noexcept{ return --this->data.use_count; }
+
+            template<class Awaiter>
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
+            }
+
+            Task get_return_object() noexcept {
+                return Task{
+                    std::coroutine_handle<promise_type>::from_promise(*this)
+                };
+            }
+
+            static Task get_return_object_on_allocation_failure() noexcept{
+                return Task{nullptr};
+            }
+
+            std::suspend_always initial_suspend() noexcept { return {}; }
+
+            auto final_suspend() noexcept{
+                struct awaiter{
+                    bool await_ready() const noexcept { return false; }
+                    std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept{
+                        auto w = h.promise().waiter;
+                        return w ? w : std::noop_coroutine();
+                    }
+
+                    void await_resume() const noexcept {}
+                };
+                return awaiter{};
+            }
+
+            void return_void() noexcept {}
+
+            void unhandled_exception() noexcept {}
+        };
+#endif
+
+        template<class T>
+        struct is_cancelable_promise{
+            static constexpr bool value = false;
+        };
+        template<class Ret, class Task>
+        struct is_cancelable_promise<cancelable_promise_type<Ret, Task>>{
+            static constexpr bool value = true;
+        };
+    };
+
+    using CancelHandle = details::CancelHandle;
+
+    template<typename T = void>
+    struct task{
+        using promise_type = details::cancelable_promise_type<T, task<T>>;
+        std::coroutine_handle<promise_type> h = nullptr;
 
         task(std::coroutine_handle<promise_type> h) noexcept : h(h) {}
         task(task&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
         void operator=(task&& other) noexcept{
-            if(this->h) this->h.destroy();
+            if(this->h){
+                if(this->h.promise().dec_ref() == 0){
+                    this->h.destroy();
+                }
+            }
             this->h = std::exchange(other.h, nullptr);
         }
         task(const task&) = delete;
 
-        ~task() {
-            if (h){
-                h.destroy();
+        ~task(){
+            if(this->h && this->h.promise().dec_ref() == 0){
+                this->h.destroy();
             }
         }
 
         bool invalid() const noexcept { return this->h == nullptr; }
 
         details::io_result<bool> cancel() noexcept{
-            if(!this->h.promise().chain){
-                return {false, ECANCELED};
-            }
-            return this->h.promise().chain->request_cancel();
+            return h.promise().request_cancel();
         }
 
         bool await_ready() const noexcept{
@@ -650,20 +945,106 @@ namespace xnet{
         template<class Promise>
         auto await_suspend(std::coroutine_handle<Promise> caller) noexcept{
             auto& promise = h.promise();
-            if constexpr(requires{ promise.chain = caller.promise().chain; }){
-                if(!caller.promise().chain){
-                    promise.chain = caller.promise().chain = new CancelChain(2);
+    #ifndef XNET_DISABLE_THREAD_SAFE
+            if constexpr(details::is_cancelable_promise<Promise>::value){
+                details::CancelChain* chain = caller.promise().data.chain.load(std::memory_order_acquire);
+                if(!chain){
+                    chain = new details::CancelChain{CancelHandle(), 2};
+                    caller.promise().data.chain.store(chain, std::memory_order_relaxed);
+                    promise.data.chain.store(chain, std::memory_order_relaxed);
                 }
                 else{
-                    promise.chain = caller.promise().chain;
-                    promise.chain->add_ref();
+                    chain->use_count.fetch_add(1, std::memory_order_relaxed);
+                    promise.data.chain.store(chain, std::memory_order_relaxed);
                 }
+                promise.data.parent.store(&caller.promise().data, std::memory_order_release);
             }
+    #else
+            if constexpr(details::is_cancelable_promise<Promise>::value){
+                details::CancelChain* chain = caller.promise().data.chain;
+                if(!chain){
+                    promise.data.chain = caller.promise().data.chain = new details::CancelChain{CancelHandle(), 2};
+                }
+                else{
+                    chain->use_count += 1;
+                    promise.data.chain = chain;
+                }
+                promise.data.parent = &caller.promise().data;
+            }
+    #endif
             promise.waiter = caller;
             return h;
         }
 
-        void await_resume() noexcept{}
+        template<class Ret, typename std::enable_if<!std::is_same<Ret, void>::value, bool>::type = true>
+        Ret get_resume_value() noexcept{
+            return std::move(h.promise().value);
+        }
+        template<class Ret, typename std::enable_if<std::is_same<Ret, void>::value, bool>::type = true>
+        Ret get_resume_value() noexcept{
+            return;
+        }
+
+        T await_resume() noexcept{
+            return get_resume_value<T>();
+        }
+
+        struct CancelToken{
+            std::coroutine_handle<promise_type> h;
+
+            CancelToken() = delete;
+            CancelToken(std::coroutine_handle<promise_type> h) noexcept : h(h) {
+                this->h.promise().add_ref();
+            }
+            CancelToken(const CancelToken& other) noexcept: h(other.h){
+                h.promise().add_ref();
+            }
+            CancelToken& operator=(const CancelToken& other) noexcept{
+                if(this->h != other.h){
+                    if(this->h && this->h.promise().dec_ref() == 0){
+                        this->h.destroy();
+                    }
+                    this->h = other.h;
+                    other.h.promise().add_ref();
+                }
+                return *this;
+            }
+            CancelToken(CancelToken&& other) noexcept: h(std::exchange(other.h, nullptr)){
+            }
+            CancelToken& operator=(CancelToken&& other) noexcept{
+                if(this->h && this->h.promise().dec_ref() == 0){
+                    this->h.destroy();
+                }
+                this->h = std::exchange(other.h, nullptr);
+                return *this;
+            }
+            ~CancelToken(){
+                if(this->h && this->h.promise().dec_ref() == 0){
+                    this->h.destroy();
+                }
+            }
+
+            details::io_result<bool> cancel() noexcept{
+                return h.promise().request_cancel();
+            }
+        };
+
+        CancelToken cancel_token() noexcept{
+            return CancelToken(this->h);
+        }
+    };
+
+    struct detached_task {
+        struct promise_type {
+            detached_task get_return_object() noexcept { return {}; }
+            static detached_task get_return_object_on_allocation_failure() noexcept { return {}; }
+
+            std::suspend_never initial_suspend() noexcept { return {}; }
+            std::suspend_never final_suspend() noexcept { return {}; }
+
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept {}
+        };
     };
 
     template<typename T = void>
@@ -902,7 +1283,6 @@ namespace xnet{
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
-            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
             std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
@@ -1100,7 +1480,6 @@ namespace xnet{
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
-            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
             std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
@@ -1222,7 +1601,6 @@ namespace xnet{
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
-            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
             std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
@@ -1446,7 +1824,6 @@ namespace xnet{
                 this->cancel_except<num_ops + 1, 0>();
                 return {true, 0};
             }
-            CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
             std::coroutine_handle<>& handle() noexcept{ return this->handler; }
 
             bool await_ready() const noexcept { return false; }
@@ -1572,9 +1949,11 @@ namespace xnet{
     class io_context{
         io_uring ring{};
         size_t evs_count;
-        #ifndef XNET_DISABLE_THREAD_SAFE
+    #ifndef XNET_DISABLE_THREAD_SAFE
         std::atomic_flag spinlock = ATOMIC_FLAG_INIT;
-        #endif
+
+        auto& get_lock() noexcept{ return this->spinlock; }
+    #endif
     public:
         static constexpr unsigned int default_flags = IORING_SETUP_CLAMP;
 
@@ -1635,7 +2014,6 @@ namespace xnet{
         }
 
 #ifndef XNET_DISABLE_THREAD_SAFE
-        auto& get_lock() noexcept{ return this->spinlock; }
         void lock() noexcept {
             while(spinlock.test_and_set(std::memory_order_acquire)){
                 spinlock.wait(true, std::memory_order_relaxed);
@@ -1643,15 +2021,10 @@ namespace xnet{
         }
         void unlock() noexcept{
             spinlock.clear(std::memory_order_release);
-            spinlock.notify_one();
         }
 #endif
 
 #ifdef XNET_DISABLE_THREAD_SAFE
-        auto& get_lock() noexcept{
-            static thread_local std::atomic<size_t> dummy;
-            return dummy;
-        }
         void lock() noexcept {}
         void unlock() noexcept{}
 #endif
@@ -1864,7 +2237,6 @@ namespace xnet{
                     AsyncStream& sender() noexcept{ return this->stream; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept{ return this->handler; }
-                    CancelHandle cancelhandle() noexcept{ return CancelHandle{this}; }
 
 
                     details::io_result<bool> cancel() noexcept{
@@ -1890,16 +2262,18 @@ namespace xnet{
 
                     template<class Promise>
                     bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->stream.ctx->lock();
-                        }
                         this->handler = h;
                         auto& result = io_context::result();
                         if constexpr(requires{ h.promise().xcoro_hook(this); }){
                             if(!h.promise().xcoro_hook(this)){
-                                result = ECANCELED;
+                                this->handler = nullptr;
+                                result = -ECANCELED;
                                 return false;
                             }
+                        }
+
+                        if constexpr(details::THREAD_SAFE_REQUIRED){
+                            this->stream.ctx->lock();
                         }
 
                         bool suspended = false;
@@ -1920,7 +2294,7 @@ namespace xnet{
                             goto FINALLY;
                         }
                         this->handler = nullptr;
-                        result = EAGAIN;
+                        result = -EAGAIN;
                     FINALLY:
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->stream.ctx->unlock();
@@ -1960,7 +2334,6 @@ namespace xnet{
                 AsyncStream& sender() noexcept{ return this->stream; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) & noexcept{ 
                     return IOTimeoutAwaiter(this->stream, s, ns, this->args); 
@@ -1993,17 +2366,18 @@ namespace xnet{
 
                 template<class Promise>
                 bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->stream.ctx->lock();
-                    }
-
                     this->handler = h;
                     auto& result = io_context::result();
                     if constexpr(requires{ h.promise().xcoro_hook(this); }){
                         if(!h.promise().xcoro_hook(this)){
-                            result = ECANCELED;
+                            this->handler = nullptr;
+                            result = -ECANCELED;
                             return false;
                         }
+                    }
+
+                    if constexpr(details::THREAD_SAFE_REQUIRED){
+                        this->stream.ctx->lock();
                     }
                     
                     bool suspended = false;
@@ -2018,7 +2392,7 @@ namespace xnet{
                         goto FINALLY;
                     }
                     this->handler = nullptr;
-                    result = EAGAIN;
+                    result = -EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->stream.ctx->unlock();
@@ -2252,7 +2626,6 @@ namespace xnet{
                     AsyncAccepter& sender() noexcept { return this->accepter; }
                     bool pending() const noexcept { return this->handler != nullptr; }
                     std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                    CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                     details::io_result<bool> cancel() noexcept{
                         if(this->handler == nullptr){
@@ -2269,20 +2642,22 @@ namespace xnet{
 
                     template<class Promise>
                     bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
-                        if constexpr(details::THREAD_SAFE_REQUIRED){
-                            this->accepter.ctx->lock();
-                        }
-
                         this->handler = h;
                         auto& result = io_context::result();
                         if constexpr(requires{ h.promise().xcoro_hook(this); }){
                             if(!h.promise().xcoro_hook(this)){
-                                result = ECANCELED;
+                                this->handler = nullptr;
+                                result = -ECANCELED;
                                 return false;
                             }
                         }
-                        unsigned left = io_uring_sq_space_left(&this->accepter.ctx->ring);
+
+                        if constexpr(details::THREAD_SAFE_REQUIRED){
+                            this->accepter.ctx->lock();
+                        }
+
                         bool suspended = false;
+                        unsigned left = io_uring_sq_space_left(&this->accepter.ctx->ring);
                         if(left >= 2){
                             io_uring_sqe* sqe1 = io_uring_get_sqe(&this->accepter.ctx->ring);
                             io_uring_sqe* sqe2 = io_uring_get_sqe(&this->accepter.ctx->ring);
@@ -2299,7 +2674,7 @@ namespace xnet{
                             goto FINALLY;
                         }
                         this->handler = nullptr;
-                        result = EAGAIN;
+                        result = -EAGAIN;
                     FINALLY:
                         if constexpr(details::THREAD_SAFE_REQUIRED){
                             this->accepter.ctx->unlock();
@@ -2341,7 +2716,6 @@ namespace xnet{
                 AsyncAccepter& sender() noexcept { return this->accepter; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 auto timeout(uint32_t s, uint32_t ns = 0) const noexcept{ 
                     return AcceptTimeoutAwaiter(this->accepter, s, ns); 
@@ -2362,19 +2736,20 @@ namespace xnet{
 
                 template<class Promise>
                 bool await_suspend(std::coroutine_handle<Promise> h) noexcept{                    
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->accepter.ctx->lock();
-                    }
-
                     this->handler = h;
                     auto& result = io_context::result();
                     if constexpr(requires{ h.promise().xcoro_hook(this); }){
                         if(!h.promise().xcoro_hook(this)){
-                            result = ECANCELED;
+                            this->handler = nullptr;
+                            result = -ECANCELED;
                             return false;
                         }
                     }
 
+                    if constexpr(details::THREAD_SAFE_REQUIRED){
+                        this->accepter.ctx->lock();
+                    }
+                    
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->accepter.ctx->ring);
                     if(sqe != nullptr){
@@ -2386,7 +2761,7 @@ namespace xnet{
                         goto FINALLY;
                     }
                     this->handler = nullptr;
-                    result = EAGAIN;
+                    result = -EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->accepter.ctx->unlock();
@@ -2461,7 +2836,6 @@ namespace xnet{
                 AsyncTimer& sender() noexcept { return this->timer; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
                     if(this->handler == nullptr){
@@ -2484,18 +2858,20 @@ namespace xnet{
 
                 template<class Promise>
                 bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->timer.ctx->lock();
-                    }
-                    
                     this->handler = h;
                     auto& result = io_context::result();
                     if constexpr(requires{ h.promise().xcoro_hook(this); }){
                         if(!h.promise().xcoro_hook(this)){
-                            result = ECANCELED;
+                            this->handler = nullptr;
+                            result = -ECANCELED;
                             return false;
                         }
                     }
+
+                    if constexpr(details::THREAD_SAFE_REQUIRED){
+                        this->timer.ctx->lock();
+                    }
+
                     bool suspended = false;
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->timer.ctx->ring);
                     if(sqe != nullptr){
@@ -2587,7 +2963,6 @@ namespace xnet{
                 AsyncFileSystem& sender(){ return this->filesystem; }
                 bool pending() const noexcept { return this->handler != nullptr; }
                 std::coroutine_handle<>& handle() noexcept { return this->handler; }
-                CancelHandle cancelhandle() noexcept { return CancelHandle{this}; }
 
                 details::io_result<bool> cancel() noexcept{
                     if(this->handler == nullptr){
@@ -2604,17 +2979,18 @@ namespace xnet{
 
                 template<class Promise>
                 bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
-                    if constexpr(details::THREAD_SAFE_REQUIRED){
-                        this->filesystem.ctx->lock();
-                    }
-
                     this->handler = h;
                     auto& result = io_context::result();
                     if constexpr(requires{ h.promise().xcoro_hook(this); }){
                         if(!h.promise().xcoro_hook(this)){
-                            result = ECANCELED;
+                            this->handler = nullptr;
+                            result = -ECANCELED;
                             return false;
                         }
+                    }
+
+                    if constexpr(details::THREAD_SAFE_REQUIRED){
+                        this->filesystem.ctx->lock();
                     }
 
                     bool suspended = false;
@@ -2628,7 +3004,7 @@ namespace xnet{
                         goto FINALLY;
                     }
                     this->handler = nullptr;
-                    result = EAGAIN;
+                    result = -EAGAIN;
                 FINALLY:
                     if constexpr(details::THREAD_SAFE_REQUIRED){
                         this->filesystem.ctx->unlock();
