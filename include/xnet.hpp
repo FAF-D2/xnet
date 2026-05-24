@@ -195,6 +195,11 @@ namespace xnet{
         struct is_poll_add<::io_uring_prep_poll_add>{
             static constexpr bool value = true;
         };
+
+        template<typename T>
+        concept has_custom_awaiter = requires(T&& t) {
+            t.operator co_await();
+        };
     };
 
     namespace details{
@@ -459,7 +464,15 @@ namespace xnet{
                 return this->data.use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
             }
 
-            template<class Awaiter>
+            template<typename Awaiter>
+                requires (details::has_custom_awaiter<Awaiter>)
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                using awaiter_t = std::decay_t<decltype(awaiter.operator co_await())>;
+                return details::Wrapper<awaiter_t, promise_type>{std::forward<Awaiter>(awaiter).operator co_await()};
+            }
+
+            template<typename Awaiter>
+                requires (!details::has_custom_awaiter<Awaiter>)
             auto await_transform(Awaiter&& awaiter) noexcept{
                 return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
@@ -609,7 +622,15 @@ namespace xnet{
                 return this->data.use_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
             }
 
-            template<class Awaiter>
+            template<typename Awaiter>
+                requires (details::has_custom_awaiter<Awaiter>)
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                using awaiter_t = std::decay_t<decltype(awaiter.operator co_await())>;
+                return details::Wrapper<awaiter_t, promise_type>{std::forward<Awaiter>(awaiter).operator co_await()};
+            }
+
+            template<typename Awaiter>
+                requires (!details::has_custom_awaiter<Awaiter>)
             auto await_transform(Awaiter&& awaiter) noexcept{
                 return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
@@ -740,7 +761,15 @@ namespace xnet{
             int add_ref() noexcept{ return ++this->data.use_count; }
             int dec_ref() noexcept{ return --this->data.use_count; }
 
-            template<class Awaiter>
+            template<typename Awaiter>
+                requires (details::has_custom_awaiter<Awaiter>)
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                using awaiter_t = std::decay_t<decltype(awaiter.operator co_await())>;
+                return details::Wrapper<awaiter_t, promise_type>{std::forward<Awaiter>(awaiter).operator co_await()};
+            }
+
+            template<typename Awaiter>
+                requires (!details::has_custom_awaiter<Awaiter>)
             auto await_transform(Awaiter&& awaiter) noexcept{
                 return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
@@ -861,7 +890,15 @@ namespace xnet{
             int add_ref() noexcept{ return ++this->data.use_count; }
             int dec_ref() noexcept{ return --this->data.use_count; }
 
-            template<class Awaiter>
+            template<typename Awaiter>
+                requires (details::has_custom_awaiter<Awaiter>)
+            auto await_transform(Awaiter&& awaiter) noexcept{
+                using awaiter_t = std::decay_t<decltype(awaiter.operator co_await())>;
+                return details::Wrapper<awaiter_t, promise_type>{std::forward<Awaiter>(awaiter).operator co_await()};
+            }
+
+            template<typename Awaiter>
+                requires (!details::has_custom_awaiter<Awaiter>)
             auto await_transform(Awaiter&& awaiter) noexcept{
                 return details::Wrapper<Awaiter, promise_type>{std::forward<Awaiter>(awaiter)};
             }
