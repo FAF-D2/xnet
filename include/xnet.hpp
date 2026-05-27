@@ -1247,12 +1247,9 @@ namespace xnet{
                 }
             }
 
-            template<size_t i = 0>
-            void start_all_tasks() noexcept{
-                if constexpr(i < num_ops){
-                    worker<i>(*this, std::get<i>(this->ops));
-                    return start_all_tasks<i+1>();
-                }
+            template<size_t... Is>
+            void start_all_tasks(std::index_sequence<Is...>) noexcept{
+                (worker<Is>(*this, std::get<Is>(this->ops)), ...);
             }
 
             template<size_t worker_id, class Op>
@@ -1332,7 +1329,7 @@ namespace xnet{
                         return false;
                     }
                 }
-                this->start_all_tasks();
+                this->start_all_tasks(std::make_index_sequence<num_ops>());
                 return true;
             }
 
@@ -1429,12 +1426,9 @@ namespace xnet{
                 }
             }
 
-            template<size_t i = 0>
-            void start_all_tasks() noexcept{
-                if constexpr(i < num_ops){
-                    worker<i>(*this, std::get<i>(this->ops));
-                    return start_all_tasks<i+1>();
-                }
+            template<size_t... Is>
+            void start_all_tasks(std::index_sequence<Is...>) noexcept{
+                (worker<Is>(*this, std::get<Is>(this->ops)), ...);
             }
 
             template<size_t worker_id, class Op>
@@ -1529,7 +1523,7 @@ namespace xnet{
                         return false;
                     }
                 }
-                this->start_all_tasks();
+                this->start_all_tasks(std::make_index_sequence<num_ops>());
                 return true;
             }
 
@@ -1553,12 +1547,9 @@ namespace xnet{
                 }
             }
 
-            template<size_t i = 0>
-            void start_all_tasks() noexcept{
-                if constexpr(i < num_ops){
-                    worker<i>(*this, std::get<i>(this->ops));
-                    return start_all_tasks<i+1>();
-                }
+            template<size_t... Is>
+            void start_all_tasks(std::index_sequence<Is...>) noexcept{
+                (worker<Is>(*this, std::get<Is>(this->ops)), ...);
             }
 
             template<size_t worker_id, class Op>
@@ -1650,7 +1641,7 @@ namespace xnet{
                         return false;
                     }
                 }
-                this->start_all_tasks();
+                this->start_all_tasks(std::make_index_sequence<num_ops>());
                 return true;
             }
 
@@ -1746,12 +1737,9 @@ namespace xnet{
                 }
             }
 
-            template<size_t i = 0>
-            void start_all_tasks() noexcept{
-                if constexpr(i < num_ops){
-                    worker<i>(*this, std::get<i>(this->ops));
-                    return start_all_tasks<i+1>();
-                }
+            template<size_t... Is>
+            void start_all_tasks(std::index_sequence<Is...>) noexcept{
+                (worker<Is>(*this, std::get<Is>(this->ops)), ...);
             }
 
             template<size_t worker_id, class Op>
@@ -1873,7 +1861,7 @@ namespace xnet{
                         return false;
                     }
                 }
-                this->start_all_tasks();
+                this->start_all_tasks(std::make_index_sequence<num_ops>());
                 return true;
             }
 
@@ -1991,6 +1979,57 @@ namespace xnet{
 
         auto& get_lock() noexcept{ return this->spinlock; }
     #endif
+
+        struct NopAwaiter{
+            io_context* ctx;
+            std::coroutine_handle<> handler;
+        public:
+            bool await_ready() noexcept{ return false; }
+
+            template<class Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
+                this->handler = h;
+                auto& result = io_context::result();
+
+                if constexpr(details::THREAD_SAFE_REQUIRED){
+                    this->ctx->lock();
+                }
+                
+                bool suspended = false;
+                io_uring_sqe* sqe = io_uring_get_sqe(&this->ctx->ring);
+                if(sqe != nullptr){
+                    io_uring_prep_nop(sqe);
+                    io_uring_sqe_set_data(sqe, h.address());
+
+                    this->ctx->add_events(1);
+                    suspended = true;
+                    goto FINALLY;
+                }
+                this->handler = nullptr;
+                result = -EAGAIN;
+            FINALLY:
+                if constexpr(details::THREAD_SAFE_REQUIRED){
+                    this->ctx->unlock();
+                }
+                return suspended;
+            }
+
+            details::io_result<size_t> await_resume() noexcept{
+                int result = io_context::result();
+                int err = result < 0 ? -result : 0;
+                size_t r = result < 0 ? 0 : static_cast<size_t>(result);
+
+                if(this->handler){
+                    this->handler = nullptr;
+                    this->ctx->sub_events(1);
+                }
+                return details::io_result<size_t>(r, err);
+            }
+
+            io_context& sender() noexcept{ return *this->ctx; }
+            bool pending() const noexcept { return this->handler != nullptr; }
+            std::coroutine_handle<>& handle() noexcept{ return this->handler; }
+        };
     public:
         static constexpr unsigned int default_flags = IORING_SETUP_CLAMP;
 
@@ -2130,6 +2169,10 @@ namespace xnet{
                 }
                 this->submit_and_wait();
             }
+        }
+
+        auto yield() noexcept{
+            return NopAwaiter{this, nullptr};
         }
 
         template<int xdomain, int xtype, bool client>
