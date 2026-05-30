@@ -143,12 +143,12 @@ xnet::detached_task client_task(xnet::io_context& ctx, int id){
     memset(sendbuf, 'A' + (id % 26), payload_size);
 
     xnet::io_result<size_t> result;
-    result = co_await client.connect((const sockaddr*)&addr, addr_size);
+    result = co_await client.connect(&addr, addr_size);
     co_await timer.timeout(1);
     while(result.err){
         ++failed;
         co_await timer.timeout(1);
-        result = co_await client.connect((const sockaddr*)&addr, addr_size);
+        result = co_await client.connect(&addr, addr_size);
     }
 
     while(true){
@@ -179,11 +179,11 @@ xnet::detached_task client_task(xnet::io_context& ctx, int id){
         ++failed;
         client.close();
         co_await timer.timeout(1);
-        result = co_await client.connect((const sockaddr *)&addr, addr_size);
+        result = co_await client.connect(&addr, addr_size);
         while(result.err){
             ++failed;
             co_await timer.timeout(1);
-            result = co_await client.connect((const sockaddr*)&addr, addr_size);
+            result = co_await client.connect(&addr, addr_size);
         }
     }
 }

@@ -27,7 +27,7 @@ xnet::detached_task client_session(xnet::io_context& ctx, int id, int timed){
     printf("[Client %d]: Connecting to %s:%d...\n", id, ip, port);
     
     auto addr = xnet::v4addr(ip, port);
-    auto success = co_await client.connect((const sockaddr*)&addr, sizeof(addr));
+    auto success = co_await client.connect(&addr, sizeof(addr));
 
     if(/* !success */ success.err){
         printf("[Client %d]: connect error: %d\n", id, success.err);

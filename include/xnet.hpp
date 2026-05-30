@@ -8,6 +8,16 @@
 #include<utility>
 #include<atomic>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #include <immintrin.h>
+    #define XNET_CPU_RELAX() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+    #define XNET_CPU_RELAX() asm volatile("yield" ::: "memory")
+#else
+    #include <thread>
+    #define XNET_CPU_RELAX() std::this_thread::yield()
+#endif
+
 // #define XNET_DISABLE_THREAD_SAFE
 #ifdef XNET_DISABLE_THREAD_SAFE
 #pragma message "xnet compiled in thread-unsafe mode"
@@ -204,7 +214,7 @@ namespace xnet{
 
     namespace details{
         template<typename T>
-        class [[nodiscard]] io_result{
+        class io_result{
         private:
             T value;
         public:
@@ -254,7 +264,7 @@ namespace xnet{
         };
 
         template<>
-        class [[nodiscard]] io_result<void>{
+        class io_result<void>{
         public:
             int err;
 
@@ -332,7 +342,7 @@ namespace xnet{
 
             void lock() noexcept {
                 while(spinlock.test_and_set(std::memory_order_acquire)){
-                    spinlock.wait(true, std::memory_order_relaxed);
+                    XNET_CPU_RELAX();
                 }
             }
             void unlock() noexcept{
@@ -2092,7 +2102,7 @@ namespace xnet{
 #ifndef XNET_DISABLE_THREAD_SAFE
         void lock() noexcept {
             while(spinlock.test_and_set(std::memory_order_acquire)){
-                spinlock.wait(true, std::memory_order_relaxed);
+                XNET_CPU_RELAX();
             }
         }
         void unlock() noexcept{
@@ -2153,7 +2163,7 @@ namespace xnet{
                 for(unsigned int i = 0; i < count; i++){
                     io_uring_cqe* cqe = cqes[i];
                     auto handle = std::coroutine_handle<>::from_address(
-                        (void*)io_uring_cqe_get_data64(cqe)
+                        io_uring_cqe_get_data(cqe)
                     );
                     if(handle){
                         result_slot = cqe->res;
@@ -2579,8 +2589,10 @@ namespace xnet{
             AwaitableSendfile sendfile(int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept {
                 return AwaitableSendfile(*this, filefd, offset, bytes, flags); 
             }
-    
-            AwaitableConnect connect(const sockaddr* addr, socklen_t addrlen) noexcept{
+
+            template<class T>
+            requires std::same_as<T, addr_type>
+            AwaitableConnect connect(const T* addr, [[maybe_unused]] socklen_t addrlen) noexcept{
                 static_assert(AsyncStream::isclient, 
                 "AysncStream<>::connect(...): only client can use this function.");
                 if(this->stream == INVALID_HANDLE){ 
@@ -2595,7 +2607,7 @@ namespace xnet{
                         }
                     }
                 }
-                return AwaitableConnect(*this, addr, addrlen);
+                return AwaitableConnect(*this, (const sockaddr*)addr, sizeof(addr_type));
             }
 
             AwaitableReadFixed read_fixed(const struct iovec* iovecs, unsigned int nr_vecs, unsigned long long offset, int buf_index) noexcept{
