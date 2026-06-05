@@ -87,112 +87,215 @@ namespace xnet{
         template<int placeholder>
         struct GET_ADDRTYPE<AF_LOCAL, placeholder>{ using type = sockaddr_un; };
 
-        static inline void prep_sendfile(io_uring_sqe* sqe, int sockfd, int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept{
-            ::io_uring_prep_splice(sqe, filefd, offset, sockfd, -1, bytes, flags);
-        }
-        static inline void prep_poll_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
+        // fix -Wsubobject-linkage
+        inline void wrap_io_uring_prep_poll_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
             (void)flags;
             return ::io_uring_prep_poll_remove(sqe, user_data);
         }
 
-        template<class F, F io_func>
+        inline auto wrap_io_uring_prep_cancel(io_uring_sqe* sqe, void* user_data, int flags) noexcept{
+            return ::io_uring_prep_cancel(sqe, user_data, flags);
+        }
+
+        inline auto wrap_io_uring_prep_timeout_remove(io_uring_sqe* sqe, unsigned long long user_data, int flags) noexcept{
+            return ::io_uring_prep_timeout_remove(sqe, user_data, flags);
+        }
+
+        inline auto wrap_io_uring_prep_poll_add(io_uring_sqe* sqe, int fd, unsigned int poll_mask) noexcept{
+            return ::io_uring_prep_poll_add(sqe, fd, poll_mask);
+        }
+
+        inline auto wrap_io_uring_prep_sendto(io_uring_sqe* sqe, int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen) noexcept{
+            return ::io_uring_prep_sendto(sqe, fd, buf, len, flags, dest_addr, addrlen);
+        }
+
+        inline auto wrap_io_uring_prep_sendmsg(io_uring_sqe* sqe, int fd, const struct msghdr* msg, unsigned int flags) noexcept{
+            return ::io_uring_prep_sendmsg(sqe, fd, msg, flags);
+        }
+
+        inline auto wrap_io_uring_prep_send(io_uring_sqe* sqe, int fd, const void* buf, size_t len, int flags) noexcept{
+            return ::io_uring_prep_send(sqe, fd, buf, len, flags);
+        }
+
+        inline auto wrap_io_uring_prep_write(io_uring_sqe* sqe, int fd, const void* buf, unsigned int nbytes, __u64 offset) noexcept{
+            return ::io_uring_prep_write(sqe, fd, buf, nbytes, offset);
+        }
+
+        inline auto wrap_io_uring_prep_writev(io_uring_sqe* sqe, int fd, const struct iovec* iovecs, unsigned int nr_vecs, __u64 offset) noexcept{
+            return ::io_uring_prep_writev(sqe, fd, iovecs, nr_vecs, offset);
+        }
+
+        inline auto wrap_io_uring_prep_write_fixed(io_uring_sqe* sqe, int fd, const void* buf, unsigned int nbytes, __u64 offset, int buf_index) noexcept{
+            return ::io_uring_prep_write_fixed(sqe, fd, buf, nbytes, offset, buf_index);
+        }
+
+        inline void wrap_io_uring_prep_sendfile(io_uring_sqe* sqe, int sockfd, int filefd, int64_t offset, unsigned int bytes, unsigned int flags) noexcept{
+            ::io_uring_prep_splice(sqe, filefd, offset, sockfd, -1, bytes, flags);
+        }
+
+        inline auto wrap_io_uring_prep_read_fixed(io_uring_sqe* sqe, int fd, void* buf, unsigned int nbytes, __u64 offset, int buf_index) noexcept{
+            return ::io_uring_prep_read_fixed(sqe, fd, buf, nbytes, offset, buf_index);
+        }
+
+        inline auto wrap_io_uring_prep_readv(io_uring_sqe* sqe, int fd, const struct iovec* iovecs, unsigned int nr_vecs, __u64 offset) noexcept{
+            return ::io_uring_prep_readv(sqe, fd, iovecs, nr_vecs, offset);
+        }
+
+        inline auto wrap_io_uring_prep_recvmsg(io_uring_sqe* sqe, int fd, struct msghdr* msg, unsigned int flags) noexcept{
+            return ::io_uring_prep_recvmsg(sqe, fd, msg, flags);
+        }
+
+        inline auto wrap_io_uring_prep_recv(io_uring_sqe* sqe, int fd, void* buf, size_t len, int flags) noexcept{
+            return ::io_uring_prep_recv(sqe, fd, buf, len, flags);
+        }
+
+        inline auto wrap_io_uring_prep_read(io_uring_sqe* sqe, int fd, void* buf, unsigned int nbytes, __u64 offset) noexcept{
+            return ::io_uring_prep_read(sqe, fd, buf, nbytes, offset);
+        }
+
+        inline auto wrap_io_uring_prep_connect(io_uring_sqe* sqe, int fd, const struct sockaddr* addr, socklen_t addrlen) noexcept{
+            return ::io_uring_prep_connect(sqe, fd, addr, addrlen);
+        }
+
+        inline auto wrap_io_uring_prep_fsync(io_uring_sqe* sqe, int fd, unsigned int fsync_flags) noexcept{
+            return ::io_uring_prep_fsync(sqe, fd, fsync_flags);
+        }
+
+        inline auto wrap_io_uring_prep_fallocate(io_uring_sqe* sqe, int fd, int mode, off_t offset, off_t len) noexcept{
+            return ::io_uring_prep_fallocate(sqe, fd, mode, offset, len);
+        }
+
+        inline auto wrap_io_uring_prep_fadvise(io_uring_sqe* sqe, int fd, off_t offset, off_t len, int advise) noexcept{
+            return ::io_uring_prep_fadvise(sqe, fd, offset, len, advise);
+        }
+
+        // FS Operations
+        inline auto wrap_io_uring_prep_openat(io_uring_sqe* sqe, int dfd, const char* path, int flags, mode_t mode) noexcept{
+            return ::io_uring_prep_openat(sqe, dfd, path, flags, mode);
+        }
+
+        inline auto wrap_io_uring_prep_renameat(io_uring_sqe* sqe, int olddfd, const char* oldpath, int newdfd, const char* newpath, unsigned int flags) noexcept{
+            return ::io_uring_prep_renameat(sqe, olddfd, oldpath, newdfd, newpath, flags);
+        }
+
+        inline auto wrap_io_uring_prep_unlinkat(io_uring_sqe* sqe, int dfd, const char* path, int flags) noexcept{
+            return ::io_uring_prep_unlinkat(sqe, dfd, path, flags);
+        }
+
+        inline auto wrap_io_uring_prep_mkdirat(io_uring_sqe* sqe, int dfd, const char* path, mode_t mode) noexcept{
+            return ::io_uring_prep_mkdirat(sqe, dfd, path, mode);
+        }
+
+        inline auto wrap_io_uring_prep_statx(io_uring_sqe* sqe, int dfd, const char* path, int flags, unsigned int mask, struct statx* statxbuf) noexcept{
+            return ::io_uring_prep_statx(sqe, dfd, path, flags, mask, statxbuf);
+        }
+
+        inline auto wrap_io_uring_prep_linkat(io_uring_sqe* sqe, int olddfd, const char* oldpath, int newdfd, const char* newpath, int flags) noexcept{
+            return ::io_uring_prep_linkat(sqe, olddfd, oldpath, newdfd, newpath, flags);
+        }
+
+        inline auto wrap_io_uring_prep_symlinkat(io_uring_sqe* sqe, const char* target, int newdfd, const char* linkpath) noexcept{
+            return ::io_uring_prep_symlinkat(sqe, target, newdfd, linkpath);
+        }
+
+        template<auto io_func>
         struct args_traits{};
         template<>
-        struct args_traits<decltype(&::io_uring_prep_poll_add), ::io_uring_prep_poll_add>{
+        struct args_traits<wrap_io_uring_prep_poll_add>{
             using args_type = std::tuple<unsigned int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_sendto), ::io_uring_prep_sendto>{
+        struct args_traits<wrap_io_uring_prep_sendto>{
             using args_type = std::tuple<const void*, size_t, int, const struct sockaddr*, socklen_t>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_sendmsg), ::io_uring_prep_sendmsg>{
+        struct args_traits<wrap_io_uring_prep_sendmsg>{
             using args_type = std::tuple<msghdr*, unsigned int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_send), ::io_uring_prep_send>{
+        struct args_traits<wrap_io_uring_prep_send>{
             using args_type = std::tuple<const void*, size_t, int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_write), ::io_uring_prep_write>{
+        struct args_traits<wrap_io_uring_prep_write>{
             using args_type = std::tuple<const void*, unsigned, __u64>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_writev), ::io_uring_prep_writev>{
+        struct args_traits<wrap_io_uring_prep_writev>{
             using args_type = std::tuple<const struct iovec*, unsigned, __u64>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_write_fixed), ::io_uring_prep_write_fixed>{
+        struct args_traits<wrap_io_uring_prep_write_fixed>{
             using args_type = std::tuple<const struct iovec*, unsigned, __u64, int>;
         };
         template<>
-        struct args_traits<decltype(&details::prep_sendfile), details::prep_sendfile>{
+        struct args_traits<wrap_io_uring_prep_sendfile>{
             using args_type = std::tuple<int, int64_t, unsigned int, unsigned int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_read_fixed), ::io_uring_prep_read_fixed>{
+        struct args_traits<wrap_io_uring_prep_read_fixed>{
             using args_type = std::tuple<const struct iovec*, unsigned, __u64, int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>{
+        struct args_traits<wrap_io_uring_prep_readv>{
             using args_type = std::tuple<const struct iovec*, unsigned, __u64>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_recvmsg), ::io_uring_prep_recvmsg>{
+        struct args_traits<wrap_io_uring_prep_recvmsg>{
             using args_type = std::tuple<msghdr*, int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_recv), ::io_uring_prep_recv>{
+        struct args_traits<wrap_io_uring_prep_recv>{
             using args_type = std::tuple<void*, size_t, int>;
         };
         template<>
-        struct args_traits<decltype(&io_uring_prep_read), io_uring_prep_read>{
+        struct args_traits<wrap_io_uring_prep_read>{
             using args_type = std::tuple<void*, unsigned int, __u64>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_connect), ::io_uring_prep_connect>{
+        struct args_traits<wrap_io_uring_prep_connect>{
             using args_type = std::tuple<const struct sockaddr*, socklen_t>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_fsync), ::io_uring_prep_fsync>{
+        struct args_traits<wrap_io_uring_prep_fsync>{
             using args_type = std::tuple<unsigned int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_fallocate), ::io_uring_prep_fallocate>{
+        struct args_traits<wrap_io_uring_prep_fallocate>{
             using args_type = std::tuple<int, __u64, __u64>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_fadvise), ::io_uring_prep_fadvise>{
+        struct args_traits<wrap_io_uring_prep_fadvise>{
             using args_type = std::tuple<__u64, off_t, int>;
         };
 
         // fs
         template<>
-        struct args_traits<decltype(&::io_uring_prep_openat), ::io_uring_prep_openat>{
+        struct args_traits<wrap_io_uring_prep_openat>{
             using args_type = std::tuple<int, const char*, int, mode_t>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_renameat), ::io_uring_prep_renameat>{
+        struct args_traits<wrap_io_uring_prep_renameat>{
             using args_type = std::tuple<int, const char*, int, const char*, unsigned int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_unlinkat), ::io_uring_prep_unlinkat>{
+        struct args_traits<wrap_io_uring_prep_unlinkat>{
             using args_type = std::tuple<int, const char*, int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_mkdirat), ::io_uring_prep_mkdirat>{
+        struct args_traits<wrap_io_uring_prep_mkdirat>{
             using args_type = std::tuple<int, const char*, mode_t>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_statx), ::io_uring_prep_statx>{
+        struct args_traits<wrap_io_uring_prep_statx>{
             using args_type = std::tuple<int, const char*, int, unsigned int, struct statx*>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_linkat), ::io_uring_prep_linkat>{
+        struct args_traits<wrap_io_uring_prep_linkat>{
             using args_type = std::tuple<int, const char*, int, const char*, int>;
         };
         template<>
-        struct args_traits<decltype(&::io_uring_prep_symlinkat), ::io_uring_prep_symlinkat>{
+        struct args_traits<wrap_io_uring_prep_symlinkat>{
             using args_type = std::tuple<const char*, int, const char*>;
         };
 
@@ -202,7 +305,7 @@ namespace xnet{
         };
 
         template<>
-        struct is_poll_add<::io_uring_prep_poll_add>{
+        struct is_poll_add<wrap_io_uring_prep_poll_add>{
             static constexpr bool value = true;
         };
 
@@ -2281,9 +2384,9 @@ namespace xnet{
                 }
             }
         private:
-            template<class P, P prep_func>
+            template<auto prep_func>
             class [[nodiscard]] IOAwaiter{
-                using args_type = typename details::args_traits<P, prep_func>::args_type;
+                using args_type = typename details::args_traits<prep_func>::args_type;
                 static constexpr size_t num_args = std::tuple_size<args_type>::value;
 
                 template<size_t i, class T, typename... Args, typename std::enable_if<(i == num_args - 1), bool>::type = true>
@@ -2335,15 +2438,15 @@ namespace xnet{
                         }
 
                         if constexpr(details::is_poll_add<prep_func>::value){
-                            using func_type = decltype(details::prep_poll_remove);
+                            using func_type = decltype(details::wrap_io_uring_prep_poll_remove);
                             using data_type = unsigned long long;
-                            return io_context::cancel<func_type, details::prep_poll_remove, data_type>(
+                            return io_context::cancel<func_type, details::wrap_io_uring_prep_poll_remove, data_type>(
                                 *this->stream.ctx, this->handler
                             );
                         }
-                        using func_type = decltype(io_uring_prep_cancel);
+                        using func_type = decltype(details::wrap_io_uring_prep_cancel);
                         using data_type = void*;
-                        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                        return io_context::cancel<func_type, details::wrap_io_uring_prep_cancel, data_type>(
                             *this->stream.ctx, this->handler
                         );
                     }
@@ -2438,16 +2541,16 @@ namespace xnet{
                     }
 
                     if constexpr(details::is_poll_add<prep_func>::value){
-                        using func_type = decltype(details::prep_poll_remove);
+                        using func_type = decltype(details::wrap_io_uring_prep_poll_remove);
                         using data_type = unsigned long long;
-                        return io_context::cancel<func_type, details::prep_poll_remove, data_type>(
+                        return io_context::cancel<func_type, details::wrap_io_uring_prep_poll_remove, data_type>(
                             *this->stream.ctx, this->handler
                         );
                     }
 
-                    using func_type = decltype(io_uring_prep_cancel);
+                    using func_type = decltype(details::wrap_io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                    return io_context::cancel<func_type, details::wrap_io_uring_prep_cancel, data_type>(
                         *this->stream.ctx, this->handler
                     );
                 }
@@ -2538,25 +2641,25 @@ namespace xnet{
                 return addr_type{};
             }
 
-            using AwaitablePollAdd = IOAwaiter<decltype(&::io_uring_prep_poll_add), ::io_uring_prep_poll_add>;
-            using AwaitableSendto = IOAwaiter<decltype(&::io_uring_prep_sendto), ::io_uring_prep_sendto>;
-            using AwaitableSendMsg = IOAwaiter<decltype(&::io_uring_prep_sendmsg), ::io_uring_prep_sendmsg>;
-            using AwaitableSend = IOAwaiter<decltype(&::io_uring_prep_send), ::io_uring_prep_send>;
-            using AwaitableWriteV = IOAwaiter<decltype(&::io_uring_prep_writev), ::io_uring_prep_writev>;
-            using AwaitableWriteFixed = IOAwaiter<decltype(&::io_uring_prep_write_fixed), ::io_uring_prep_write_fixed>;
-            using AwaitableWrite = IOAwaiter<decltype(&::io_uring_prep_write), ::io_uring_prep_write>;
-            using AwaitableSendfile = IOAwaiter<decltype(&details::prep_sendfile), details::prep_sendfile>;
-            using AwaitableConnect = IOAwaiter<decltype(&::io_uring_prep_connect), ::io_uring_prep_connect>;
+            using AwaitablePollAdd = IOAwaiter<details::wrap_io_uring_prep_poll_add>;
+            using AwaitableSendto = IOAwaiter<details::wrap_io_uring_prep_sendto>;
+            using AwaitableSendMsg = IOAwaiter<details::wrap_io_uring_prep_sendmsg>;
+            using AwaitableSend = IOAwaiter<details::wrap_io_uring_prep_send>;
+            using AwaitableWriteV = IOAwaiter<details::wrap_io_uring_prep_writev>;
+            using AwaitableWriteFixed = IOAwaiter<details::wrap_io_uring_prep_write_fixed>;
+            using AwaitableWrite = IOAwaiter<details::wrap_io_uring_prep_write>;
+            using AwaitableSendfile = IOAwaiter<details::wrap_io_uring_prep_sendfile>;
+            using AwaitableConnect = IOAwaiter<details::wrap_io_uring_prep_connect>;
 
-            using AwaitableReadFixed = IOAwaiter<decltype(&::io_uring_prep_read_fixed), ::io_uring_prep_read_fixed>;
-            using AwaitableReadV = IOAwaiter<decltype(&::io_uring_prep_readv), ::io_uring_prep_readv>;
-            using AwaitableRecvMsg = IOAwaiter<decltype(&::io_uring_prep_recvmsg), ::io_uring_prep_recvmsg>;
-            using AwaitableRecv = IOAwaiter<decltype(&::io_uring_prep_recv), ::io_uring_prep_recv>;
-            using AwaitableRead = IOAwaiter<decltype(&::io_uring_prep_read), ::io_uring_prep_read>;
+            using AwaitableReadFixed = IOAwaiter<details::wrap_io_uring_prep_read_fixed>;
+            using AwaitableReadV = IOAwaiter<details::wrap_io_uring_prep_readv>;
+            using AwaitableRecvMsg = IOAwaiter<details::wrap_io_uring_prep_recvmsg>;
+            using AwaitableRecv = IOAwaiter<details::wrap_io_uring_prep_recv>;
+            using AwaitableRead = IOAwaiter<details::wrap_io_uring_prep_read>;
             
-            using AwaitableFsync = IOAwaiter<decltype(&::io_uring_prep_fsync), ::io_uring_prep_fsync>;
-            using AwaitableFallocate = IOAwaiter<decltype(&::io_uring_prep_fallocate), ::io_uring_prep_fallocate>;
-            using AwaitableFadvise = IOAwaiter<decltype(&::io_uring_prep_fadvise), ::io_uring_prep_fadvise>;
+            using AwaitableFsync = IOAwaiter<details::wrap_io_uring_prep_fsync>;
+            using AwaitableFallocate = IOAwaiter<details::wrap_io_uring_prep_fallocate>;
+            using AwaitableFadvise = IOAwaiter<details::wrap_io_uring_prep_fadvise>;
 
 
             AwaitablePollAdd poll_add(unsigned int poll_mask) noexcept{
@@ -2723,9 +2826,9 @@ namespace xnet{
                         if(this->handler == nullptr){
                             return {false, ECANCELED};
                         }
-                        using func_type = decltype(io_uring_prep_cancel);
+                        using func_type = decltype(details::wrap_io_uring_prep_cancel);
                         using data_type = void*;
-                        return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                        return io_context::cancel<func_type, details::wrap_io_uring_prep_cancel, data_type>(
                             *this->accepter.ctx, this->handler
                         );
                     }
@@ -2817,9 +2920,9 @@ namespace xnet{
                     if(this->handler == nullptr){
                         return {false, ECANCELED};
                     }
-                    using func_type = decltype(io_uring_prep_cancel);
+                    using func_type = decltype(details::wrap_io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                    return io_context::cancel<func_type, details::wrap_io_uring_prep_cancel, data_type>(
                         *this->accepter.ctx, this->handler
                     );
                 }
@@ -2933,9 +3036,9 @@ namespace xnet{
                     if(this->handler == nullptr){
                         return {false, ECANCELED};
                     }
-                    using func_type = decltype(io_uring_prep_timeout_remove);
+                    using func_type = decltype(details::wrap_io_uring_prep_timeout_remove);
                     using data_type = unsigned long long;
-                    return io_context::cancel<func_type, io_uring_prep_timeout_remove, data_type>(
+                    return io_context::cancel<func_type, details::wrap_io_uring_prep_timeout_remove, data_type>(
                         *this->timer.ctx, this->handler
                     );
                 }
@@ -3014,9 +3117,9 @@ namespace xnet{
             void operator=(AsyncFileSystem&&) = delete;
             ~AsyncFileSystem() = default;
         private:
-            template<class P, P prep_func, class Ret>
+            template<auto prep_func, class Ret>
             class [[nodiscard]] FileSystemAwaiter{
-                using args_type = typename details::args_traits<P, prep_func>::args_type;
+                using args_type = typename details::args_traits<prep_func>::args_type;
                 static constexpr size_t num_args = std::tuple_size<args_type>::value;
 
                 template<size_t i, class T, typename... Args, typename std::enable_if<(i == num_args - 1), bool>::type = true>
@@ -3060,9 +3163,9 @@ namespace xnet{
                     if(this->handler == nullptr){
                         return {false, ECANCELED};
                     }
-                    using func_type = decltype(io_uring_prep_cancel);
+                    using func_type = decltype(details::wrap_io_uring_prep_cancel);
                     using data_type = void*;
-                    return io_context::cancel<func_type, io_uring_prep_cancel, data_type>(
+                    return io_context::cancel<func_type, details::wrap_io_uring_prep_cancel, data_type>(
                         *this->filesystem.ctx, this->handler
                     );
                 }
@@ -3124,13 +3227,13 @@ namespace xnet{
                     }
                 }
             };
-            using OpenAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_openat), ::io_uring_prep_openat, AsyncFile>;
-            using MkDirAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_mkdirat), ::io_uring_prep_mkdirat, int>;
-            using RenameAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_renameat), ::io_uring_prep_renameat, int>;
-            using UnlinkAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_unlinkat), ::io_uring_prep_unlinkat, int>;
-            using StatxAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_statx), ::io_uring_prep_statx, int>;
-            using LinkAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_linkat), ::io_uring_prep_linkat, int>;
-            using SymlinkAtAwaiter = FileSystemAwaiter<decltype(&::io_uring_prep_symlinkat), ::io_uring_prep_symlinkat, int>;
+            using OpenAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_openat, AsyncFile>;
+            using MkDirAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_mkdirat, int>;
+            using RenameAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_renameat, int>;
+            using UnlinkAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_unlinkat, int>;
+            using StatxAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_statx, int>;
+            using LinkAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_linkat, int>;
+            using SymlinkAtAwaiter = FileSystemAwaiter<details::wrap_io_uring_prep_symlinkat, int>;
         public:
             io_context& context() noexcept { return *this->ctx; }
             void rebind_context(io_context& other_ctx) noexcept { this->ctx = &other_ctx; }
