@@ -3,7 +3,7 @@
 ## About this project
 xnet is a **lightweight, ~3k-line, header-only** async I/O layer that exposes minimal awaiters built on **io_uring (via liburing)** and **C++20 coroutines**.
 
-It does **one thing only**: fast, minimal, scheduler‑agnostic asynchronous I/O — with each IOAwaiter costing only **32–64 bytes** of overhead.
+It does **one thing only**: fast, minimal, scheduler‑agnostic asynchronous I/O — with each IOAwaiter costing only **32–64 bytes** of overhead in the coroutine frame.
 
 **No scheduler, no runtime — just the minimal I/O primitives you can drop directly into your own coroutine system.*
 
@@ -12,13 +12,17 @@ It does **one thing only**: fast, minimal, scheduler‑agnostic asynchronous I/O
 xnet is header-only, so there is nothing to build.  
 Just drop `include/xnet.hpp` into your project and add the include path.
 
+```bash
+wget https://raw.githubusercontent.com/FAF-D2/xnet/master/include/xnet.hpp
+```
+
 ```cpp
 #include"xnet.hpp"
 ```
 
-BUT you will also need:
+You will also need:
 - Linux kernel **5.15+** (Recommended 5.17+)
-- `liburing-dev`
+- `liburing-dev` >= 2.0
 - A C++20 compiler
 
 if liburing not installed: **Ubuntu / Debian**
@@ -26,6 +30,94 @@ if liburing not installed: **Ubuntu / Debian**
 sudo apt update
 sudo apt install liburing-dev
 ```
+
+
+## Examples
+*See more examples in the [examples/](./examples/) directory.*
+
+A echo implementation is simple as follows:
+
+```cpp
+xnet::detached_task echo(xnet::TCPServer conn){
+    char buf[64];
+    while(true){
+        auto n = co_await conn.recv(buf, sizeof(buf), 0).timeout(60);
+        if (!n || *n == 0) break; // closed
+
+        co_await conn.send(buf, *n, 0);
+    }
+}
+
+xnet::task<> accept_loop(xnet::io_context& ctx) {
+    xnet::io_context::TCPAccepter accepter(ctx, xnet::v4addr("127.0.0.1", 52333));
+
+    while (true) {
+        auto conn = co_await accepter.accept();
+        echo(conn.move()); // spawn echo coroutine
+    }
+}
+```
+Also, xnet provides some async combinators (all, allSettled, any, race) that can simply group the coroutine
+
+```cpp
+auto result = co_await xnet::race(coro1, coro2, coro3);
+auto result = co_await xnet::any(coro1, coro2, coro3);
+auto result = co_await xnet::all(coro1, coro2, coro3);
+auto [res1, res2, res3] = co_await xnet::allSettled(coro1, coro2, coro3);
+```
+
+
+You might want to write your own scheduler as xnet do not assume any schedular scenario *(multi-threads, single-thread, etc.)*. A possible implementation is:
+
+For simplicity use, or you can just use ctx.run_until_complete() for a basic scheduler
+```cpp
+int main(){
+    xnet::io_context ctx(128);
+
+    xnet::fire(accept_loop(ctx););
+
+    ctx.run_until_complete();
+}
+```
+Or self-defined scheduler:
+```cpp
+void my_scheduler(xnet::io_context& ctx){
+    io_uring* ring = ctx.native();
+    io_uring_cqe* cqes[CQE_BATCH];
+
+    ctx.submit_and_wait();
+    while(true){
+        unsigned int count = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH);
+
+        for(unsigned int i = 0; i < count; i++){
+            io_uring_cqe* cqe = cqes[i];
+            auto handle = std::coroutine_handle<>::from_address(
+                (void*)io_uring_cqe_get_data64(cqe)
+            );
+            if(handle){
+                int& result_slot = xnet::io_context::result();
+                result_slot = cqe->res;
+                handle.resume();
+            }
+            if((i + 1) % 256 == 0){
+                ctx.submit();
+            }
+        }
+        io_uring_cq_advance(ring, count);
+        ctx.submit_and_wait();
+    }
+}
+
+int main(){
+    xnet::io_context ctx(128);
+    auto coro = accept_loop(ctx);
+    xnet::fire(std::move(coro));
+
+    // scheduler
+    my_scheduler();
+}
+```
+
 
 ## Benchmark
 
@@ -61,87 +153,6 @@ Each client sends a 500‑byte echo request every 0–20 ms (uniform random), me
 | **xnet** | **235.57 ms** | **303.257 ms** | **42,133** |
 | Asio | 249.524 ms | 318.82 ms | 40,876 |
 | Go | 309.681 ms |  311.7 ms | 41,056 |
-
-
-
-
-## Some Examples
-*See more examples in the [examples/](./examples/) directory.*
-
-A echo implementation is simple as follows:
-
-```cpp
-xnet::detached_task echo(xnet::TCPServer conn){
-    char buf[64];
-    while(true){
-        auto n = co_await conn.recv(buf, sizeof(buf), 0).timeout(60);
-        if (!n || *n == 0) break; // closed
-
-        co_await conn.send(buf, *n, 0);
-    }
-}
-
-xnet::task<> accept_loop(xnet::io_context& ctx) {
-    xnet::io_context::TCPAccepter accepter(ctx, xnet::v4addr("127.0.0.1", 52333));
-
-    while (true) {
-        auto conn = co_await accepter.accept();
-        echo(conn.move()); // spawn echo coroutine
-    }
-}
-```
-You will need to write your own scheduler as xnet do not assume any schedular scenario *(multi-threads, single-thread, etc.)*. A possible implementation is:
-
-For simplicity use, or you can just use ctx.run_until_complete() for a basic scheduler
-```cpp
-void my_scheduler(xnet::io_context& ctx){
-    io_uring* ring = ctx.native();
-    io_uring_cqe* cqes[CQE_BATCH];
-
-    ctx.submit_and_wait();
-    while(true){
-        unsigned int count = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH);
-
-        for(unsigned int i = 0; i < count; i++){
-            io_uring_cqe* cqe = cqes[i];
-            auto handle = std::coroutine_handle<>::from_address(
-                (void*)io_uring_cqe_get_data64(cqe)
-            );
-            if(handle){
-                int& result_slot = xnet::io_context::result();
-                result_slot = cqe->res;
-                handle.resume();
-            }
-            if((i + 1) % 256 == 0){
-                ctx.submit();
-            }
-        }
-        io_uring_cq_advance(ring, count);
-        ctx.submit_and_wait();
-    }
-}
-
-int main(){
-    xnet::io_context ctx(128);
-    auto coro = accept_loop(ctx);
-    coro.start() // start the coroutine until co await
-
-    // scheduler
-    my_scheduler();
-    // or
-    // ctx.run_until_complete();
-}
-```
-
-Also, xnet provides some async combinators (all, allSettled, any, race) that can simply group the coroutine
-
-```cpp
-auto result = co_await xnet::race(coro1, coro2, coro3);
-auto result = co_await xnet::any(coro1, coro2, coro3);
-auto result = co_await xnet::all(coro1, coro2, coro3);
-auto result = co_await xnet::allSettled(coro1, coro2, coro3);
-```
-
 
 ## xnet contract
 *xnet does not ship a scheduler. Instead, it defines a minimal contract between your run loop and the awaiters*.
@@ -181,7 +192,7 @@ size_t readed_bytes = *result;
 
 ### Core type
 1. `xnet::io_context`  
-Owns the io_uring instance and provides `submit()`,  `result()`, and all interfaces needed for any scheduler.
+Owns the io_uring instance and provides `submit()`,  `result()`, `run_until_complete()`, and all interfaces needed for any scheduler.
 
 2. `xnet::io_result<T>`  
 Result type returned by all IO awaiters: { T value, int err }.
@@ -201,7 +212,7 @@ Coroutine types for user coroutines. detached_task is a fire & forget coroutine,
 
 6. Safe Cancellation
 
-See `examples/cancel_chain.cpp` for more details
+See `examples/cancel_chain.cpp` for more examples
 
 ```cpp
 xnet::task<> coro(){
@@ -211,14 +222,13 @@ xnet::task<> coro(){
 auto task = coro();
 auto token = task.cancel_token();
 // pass token to other coroutines or threads
+other_thread(std::move(token));
 co_await task;
 ```
 
 ## Cancellation mechanism
 xnet provides the ref-count model for cancellation in task type. If you do care about overhead, use `xnet::ptask` instead.
 The overhead of hooking cancellation chain is 40-50 cycles (~20ns) in thread_safe mode each `await_suspend`.
-
-Each IOAwaiter will write their cancel fatpointer in a common-space shared by all nodes in the coroutines tree and then modify task state in the call chain in the recursion. So the cancellation of a task will not affect the whole tree but only the chain in its fanouts.
 
 The cancellation usage:
 ```cpp
@@ -242,5 +252,27 @@ The return value of `cancel()` is io_result\<bool\>:
 + {true, 0} cancel signal sended, will cancel the actual IO if it is not completed
 + {false, EAGAIN}  the coroutine is not suspended or suspended failed (Get SQE error)
 + {false, ECANCELLED} (the coroutine is already finished)
+
+
+The magic behide this is that each IOAwaiter will write their cancel fatpointer `SomeCancelFatPointer(*this)` in a common-space shared by all nodes in the coroutines tree once being co_awaited, and then modify each task state of the call chain in the recursion. Once completed, the task state will be reseted as well. A cancellation of a task will not affect the whole tree but only cancel the chain in its fanouts if correctly implement hooking:
+
+```cpp
+template<class Promise>
+bool await_suspend(std::coroutine_handle<Promise> h) noexcept{
+    this->handler = h;
+    auto& result = io_context::result();
+    if constexpr(requires{ h.promise().xcoro_hook(this); }){
+        if(!h.promise().xcoro_hook(this)){
+            // if hook failed, it means its father has been cancelled
+            this->handler = nullptr;
+            result = -ECANCELED;
+            return false;
+        }
+    }
+    // ... other logic
+    // ...
+    return true;
+}
+```
 
 Implement a correct task type with correct cancellation implementation is hard, so it is recommended that use the `task<>` directly if you need cancellation or `ptask<>` if you do not care about the cancellation.

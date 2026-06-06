@@ -2249,6 +2249,28 @@ namespace xnet{
             }
         }
 
+        template<size_t max_evs = 256>
+        size_t run_once() noexcept{
+            if(this->evs_count == 0){
+                return 0;
+            }
+            io_uring_cqe* cqes[max_evs];
+            int& result_slot = xnet::io_context::result();
+            unsigned int count = io_uring_peek_batch_cqe(&this->ring, cqes, max_evs);
+            for(unsigned int i = 0; i < count; i++){
+                io_uring_cqe* cqe = cqes[i];
+                auto handle = std::coroutine_handle<>::from_address(
+                    io_uring_cqe_get_data(cqe)
+                );
+                if(handle){
+                    result_slot = cqe->res;
+                    handle.resume();
+                }
+            }
+            io_uring_cq_advance(&this->ring, count);
+            return static_cast<size_t>(count);
+        }
+
         // basic scheduler for simplicity
         void run_until_complete() noexcept{
             if(this->evs_count == 0){
